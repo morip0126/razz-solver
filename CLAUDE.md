@@ -1,8 +1,18 @@
 # 開発メモ（Razz Solver）
 
 Razz（セブンカードスタッド・ローボール、A-5 ロー）のスポットソルバー。Vite + React + TypeScript。
-ofc-solver から独立させたリポジトリ。UI は未実装（ドメインロジックのみ）。
+ofc-solver から独立させたリポジトリ。
 重い計算を UI に載せるときは Web Worker で実行する（ofc-solver と同じ流儀）。
+
+## UI（src/App.tsx + src/worker/solverWorker.ts）
+
+- レンジグリッド UI（3rd street）: 各ポジションのアップカード（ランクのみ、スートは自動割り当て）
+  と履歴文字列（f/c/r 等）を入力 → `solveRazzRangeGrid` を Worker で実行し、手番プレイヤーの
+  伏せ札 2 枚の全 91 ランクペアの戦略を 13×13 三角グリッドで表示（青=fold 緑=check/call 赤=bet/raise）。
+- 下部のアクションボタン（コンボ数加重の全体頻度つき）で履歴を進め、「戻る」で 1 手戻す。
+  どちらも自動で再計算する。
+- Worker は再計算のたびに terminate → 新規生成（キャンセル代わり）。進捗は
+  `RazzSolveOptions.onProgress`（MCCFR 約1%刻み）経由でプログレスバーに反映。
 
 ## ビルド / 確認
 
@@ -42,6 +52,10 @@ ofc-solver から独立させたリポジトリ。UI は未実装（ドメイン
   - 学習時は Hero の伏せ札もレンジからサンプル（公開情報ベースの均衡計算）。Hero の実ハンドの
     EV は学習後に実ハンドを固定したロールアウト（`estimateActionValues`）で推定。
   - スタック無限（オールインなし）。ブリングインは最高位アップカード（同ランクはスート c<d<h<s）。
+- `solveRazzRangeGrid`（razzGame.ts）: レンジグリッド解析。Hero の実ハンドを固定せず、履歴後に
+  手番となるプレイヤーの伏せ札 2 枚の全ランクペア（91 通り）の平均戦略とコンボ数を返す。
+  バケット抽象化のため同一バケットのペアは同じ戦略になる。7th（伏せ札 3 枚）は非対応。
+  履歴は `coerceRazzAction` で 1 文字表記（f/k/x/c/b/p/r）を局面の合法アクションへ解決する。
 - 重い（HU 3rd street で既定パラメータ数十秒）ので UI に載せるときは Worker 経由で呼ぶこと。
 
 ## 注意

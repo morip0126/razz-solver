@@ -41,6 +41,7 @@ import {
   type RazzSeatInput,
   estimateRazzEquity,
   validateRazzInput,
+  validateRazzPublic,
 } from './razzEquity'
 
 // ---- 公開型 -------------------------------------------------------------------
@@ -103,6 +104,51 @@ export interface RazzSolveOptions {
   equityIters?: number
   rng?: () => number
   range?: RazzRangeModel
+  /** MCCFR 学習の進捗通知（約1%刻み）。Worker から UI へ返す用。 */
+  onProgress?: (done: number, total: number) => void
+}
+
+/**
+ * レンジグリッド解析（GTO Wizard 風）のスポット。Hero の実ハンドは固定せず、
+ * 履歴の後に手番となるプレイヤーの「伏せ札2枚の全ランクペア」の戦略を返す。
+ */
+export interface RazzGridSpot {
+  street: RazzStreet
+  /** 現在ストリート開始時点でアクティブな全プレイヤー（シート順）。 */
+  seats: RazzSeatInput[]
+  /** フォールドで見えたカードなどのデッドカード。 */
+  dead?: Card[]
+  stakes: RazzStakes
+  /** 現在ストリート開始時点のポット。3rd street では省略時 ante × 人数。 */
+  pot?: number
+  /**
+   * 現在ストリートのアクション履歴（行動順）。"ffffr" のような文字列、
+   * またはラベル / 1文字表記（f=fold, k/x=check, c=call/check, b/p/r=bet/complete/raise）の配列。
+   */
+  history?: string | readonly string[]
+  /** 3rd street のブリングイン席。省略時は最高位のアップカードから自動判定。 */
+  bringInIndex?: number
+}
+
+export interface RazzGridCell {
+  /** 伏せ札2枚の Razz ランク（1=A .. 13=K）、昇順。 */
+  ranks: [number, number]
+  /** 見えているカードを除いた残りデッキから作れるコンボ数。 */
+  combos: number
+  /** actions と同順の頻度（平均戦略）。 */
+  frequencies: number[]
+}
+
+export interface RazzGridResult {
+  /** 履歴の後に手番となる席。このプレイヤーの戦略グリッド。 */
+  actorIndex: number
+  actions: RazzActionLabel[]
+  /** 全 91 ランクペア（A..K の組み合わせ + ペア）。 */
+  cells: RazzGridCell[]
+  /** コンボ数で加重した全体頻度（actions と同順）。 */
+  totals: number[]
+  horizon: 'river' | 'street'
+  iterations: number
 }
 
 // ---- 内部状態 -------------------------------------------------------------------
@@ -159,6 +205,33 @@ const ACTION_CHAR: Record<RazzActionLabel, string> = {
   bet: 'b',
   complete: 'p',
   raise: 'r',
+}
+
+// 1文字表記 → 候補ラベル（合法な最初のものを採用）。c はベットに直面していなければ
+// check、b/p/r はその局面の攻撃的アクション（bet / complete / raise）に解決する。
+const ACTION_ALIASES: Record<string, readonly RazzActionLabel[]> = {
+  f: ['fold'],
+  k: ['check'],
+  x: ['check'],
+  c: ['call', 'check'],
+  b: ['bet', 'complete', 'raise'],
+  p: ['complete', 'bet', 'raise'],
+  r: ['raise', 'complete', 'bet'],
+}
+
+/**
+ * アクション表記（ラベルまたは 1 文字）を合法アクションへ解決する。
+ * 解決できなければ null。
+ */
+export function coerceRazzAction(
+  input: string,
+  legal: readonly RazzActionLabel[],
+): RazzActionLabel | null {
+  if ((legal as readonly string[]).includes(input)) return input as RazzActionLabel
+  const candidates = ACTION_ALIASES[input.toLowerCase()]
+  if (!candidates) return null
+  for (const a of candidates) if (legal.includes(a)) return a
+  return null
 }
 
 function cloneState(s: BetState): BetState {
@@ -428,24 +501,41 @@ function sampleRazzDeal(
 
 // ---- スポット構築 ---------------------------------------------------------------
 
-function buildCtx(spot: RazzSpot, opts: RazzSolveOptions): SpotCtx {
-  validateRazzInput(spot)
-  const { street, seats, heroIndex, heroDown, dead = [], stakes: stakesIn } = spot
-  const stakes: Required<RazzStakes> = { raiseCap: 4, ...stakesIn }
+interface BuildInput {
+  street: RazzStreet
+  seats: RazzSeatInput[]
+  dead: Card[]
+  stakes: RazzStakes
+  pot?: number
+  bringInIndex?: number
+  /** 現在ストリートの既出アクション（ラベルまたは 1 文字表記）。 */
+  history: readonly string[]
+  /** null = グリッド解析（履歴後の手番席を Hero に採用し、実ハンドは固定しない）。 */
+  hero: { index: number; down: Card[] } | null
+}
+
+function buildCtx(input: BuildInput, opts: RazzSolveOptions): SpotCtx {
+  const { street, seats, dead, hero } = input
+  if (hero) {
+    validateRazzInput({ street, seats, heroIndex: hero.index, heroDown: hero.down, dead })
+  } else {
+    validateRazzPublic(street, seats, dead)
+  }
+  const stakes: Required<RazzStakes> = { raiseCap: 4, ...input.stakes }
   if (stakes.ante < 0 || stakes.bringIn <= 0 || stakes.smallBet <= 0 || stakes.bigBet <= 0) {
     throw new Error('razz: stakes must be positive')
   }
   if (stakes.bringIn >= stakes.smallBet) {
     throw new Error('razz: bringIn must be smaller than smallBet')
   }
-  if (street > 3 && spot.pot == null) {
+  if (street > 3 && input.pot == null) {
     throw new Error('razz: pot at street start is required for streets after 3rd')
   }
 
   const n = seats.length
   const state: BetState = {
     street,
-    pot: spot.pot ?? stakes.ante * n,
+    pot: input.pot ?? stakes.ante * n,
     contrib: new Array(n).fill(0),
     afterRoot: new Array(n).fill(0),
     folded: new Array(n).fill(false),
@@ -459,7 +549,7 @@ function buildCtx(spot: RazzSpot, opts: RazzSolveOptions): SpotCtx {
   }
 
   if (street === 3) {
-    const bi = spot.bringInIndex ?? razzBringInIndex(seats)
+    const bi = input.bringInIndex ?? razzBringInIndex(seats)
     state.contrib[bi] = stakes.bringIn
     state.betLevel = stakes.bringIn
     state.actor = (bi + 1) % n
@@ -471,8 +561,8 @@ function buildCtx(spot: RazzSpot, opts: RazzSolveOptions): SpotCtx {
   const ctxPartial: SpotCtx = {
     seats,
     n,
-    heroIndex,
-    heroDown,
+    heroIndex: hero?.index ?? -1,
+    heroDown: hero?.down ?? [],
     stakes,
     horizon: 7, // リプレイでは未使用（現在ストリート内のみ）。後で確定する。
     root: state,
@@ -482,25 +572,30 @@ function buildCtx(spot: RazzSpot, opts: RazzSolveOptions): SpotCtx {
     seatWeights: seats.map((s) => rankWeightTable(new Set(s.up.map(razzRank)), range)),
   }
 
-  // 現在ストリートのアクション履歴をリプレイ
+  // 現在ストリートのアクション履歴をリプレイ（1 文字表記は合法アクションへ解決）
   let cur = state
-  for (const action of spot.actionsSoFar ?? []) {
+  for (const raw of input.history) {
     if (cur.done || cur.actor < 0) throw new Error('razz: actionsSoFar continue past end of hand')
-    if (!legalActionsOf(cur, ctxPartial).includes(action)) {
-      throw new Error(`razz: illegal action "${action}" in actionsSoFar`)
+    const action = coerceRazzAction(raw, legalActionsOf(cur, ctxPartial))
+    if (!action) {
+      throw new Error(`razz: illegal action "${raw}" in actionsSoFar`)
     }
     cur = applyAction(cur, ctxPartial, null, action)
   }
   if (cur.done) throw new Error('razz: hand is already over after actionsSoFar')
-  if (cur.actor !== heroIndex) {
+  if (hero && cur.actor !== hero.index) {
     throw new Error(`razz: after actionsSoFar it is seat ${cur.actor}'s turn, not hero's`)
   }
   cur.afterRoot = new Array(n).fill(0)
 
+  const heroIndex = hero?.index ?? cur.actor
+  const heroDown = hero?.down ?? []
   const horizon = activeCount(cur) === 2 ? 7 : street
   const visible = [...seats.flatMap((s) => s.up), ...dead]
   return {
     ...ctxPartial,
+    heroIndex,
+    heroDown,
     horizon,
     root: cur,
     trainPool: remainingDeck(visible),
@@ -533,10 +628,22 @@ export function solveRazzSpot(spot: RazzSpot, opts: RazzSolveOptions = {}): Razz
   const rng = opts.rng ?? mulberry32((Math.random() * 0xffffffff) >>> 0)
   const iterations = opts.iterations ?? 30000
   const evalSamples = opts.evalSamples ?? 6000
-  const ctx = buildCtx(spot, opts)
+  const ctx = buildCtx(
+    {
+      street: spot.street,
+      seats: spot.seats,
+      dead: spot.dead ?? [],
+      stakes: spot.stakes,
+      pot: spot.pot,
+      bringInIndex: spot.bringInIndex,
+      history: spot.actionsSoFar ?? [],
+      hero: { index: spot.heroIndex, down: spot.heroDown },
+    },
+    opts,
+  )
 
   // 学習: Hero の伏せ札もレンジからサンプルして均衡を近似する
-  const sol = runMccfr(makeGame(ctx, null), { iterations, rng })
+  const sol = runMccfr(makeGame(ctx, null), { iterations, rng, onProgress: opts.onProgress })
 
   // 評価: Hero の実ハンドを固定してアクションごとの EV をロールアウト推定
   const evalGame = makeGame(ctx, ctx.heroDown)
@@ -580,5 +687,93 @@ export function solveRazzSpot(spot: RazzSpot, opts: RazzSolveOptions = {}): Razz
     horizon: activeCount(ctx.root) === 2 ? 'river' : 'street',
     iterations,
     evalSamples,
+  }
+}
+
+/** Razz ランク（1=A..13=K）からダミーカードを作る（バケット計算はランクのみ参照）。 */
+function cardOfRazzRank(r: number): Card {
+  return { rank: (r === 1 ? 14 : r) as Card['rank'], suit: 'c' }
+}
+
+/** 文字列履歴を 1 文字ずつの配列へ（空白・区切り記号は無視）。 */
+function historyChars(history: RazzGridSpot['history']): readonly string[] {
+  if (history == null) return []
+  if (typeof history === 'string') return [...history.replace(/[\s/,.|-]+/g, '')]
+  return history
+}
+
+/**
+ * レンジグリッド解析: 履歴の後に手番となるプレイヤーについて、伏せ札 2 枚の
+ * 全ランクペア（91 通り）の平均戦略を返す。実ハンドは固定せず、公開情報
+ * （全員のアップカード + 履歴）だけで解く。バケット抽象化のため、同じバケットに
+ * 落ちるランクペアは同一の戦略になる。7th street（伏せ札 3 枚）は非対応。
+ * 重い計算なので UI からは Web Worker 経由で呼ぶこと。
+ */
+export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = {}): RazzGridResult {
+  if (spot.street === 7) {
+    throw new Error('razz: range grid is not supported on 7th street (3 downcards)')
+  }
+  const rng = opts.rng ?? mulberry32((Math.random() * 0xffffffff) >>> 0)
+  const iterations = opts.iterations ?? 30000
+  const ctx = buildCtx(
+    {
+      street: spot.street,
+      seats: spot.seats,
+      dead: spot.dead ?? [],
+      stakes: spot.stakes,
+      pot: spot.pot,
+      bringInIndex: spot.bringInIndex,
+      history: historyChars(spot.history),
+      hero: null,
+    },
+    opts,
+  )
+
+  const sol = runMccfr(makeGame(ctx, null), { iterations, rng, onProgress: opts.onProgress })
+
+  const actor = ctx.heroIndex
+  const actions = legalActionsOf(ctx.root, ctx)
+
+  // 情報集合キーの公開情報部分（infosetKeyOf と同じ構成。ボードティアは
+  // 現在ストリートのアップカードから決定的に求まる）
+  let tiers = ''
+  for (let i = 0; i < ctx.n; i++) {
+    if (i === actor) continue
+    tiers += ctx.root.folded[i] ? 'F' : String(razzBoardTier(ctx.seats[i].up))
+  }
+
+  // ランクごとの残り枚数（見えているカードを除く）→ ランクペアのコンボ数
+  const avail = new Array<number>(14).fill(0)
+  for (const c of ctx.trainPool) avail[razzRank(c)]++
+
+  const cells: RazzGridCell[] = []
+  const totals = new Array<number>(actions.length).fill(0)
+  let totalCombos = 0
+  for (let r1 = 1; r1 <= 13; r1++) {
+    for (let r2 = r1; r2 <= 13; r2++) {
+      const combos =
+        r1 === r2 ? (avail[r1] * (avail[r1] - 1)) / 2 : avail[r1] * avail[r2]
+      const hand = [cardOfRazzRank(r1), cardOfRazzRank(r2), ...ctx.seats[actor].up]
+      const bucket = razzHandBucket(hand)
+      const key = `${ctx.root.street}|${ctx.root.hist}|${bucket}|${tiers}`
+      const frequencies = averageStrategy(sol, key, actions.length)
+      cells.push({ ranks: [r1, r2], combos, frequencies })
+      if (combos > 0) {
+        totalCombos += combos
+        for (let i = 0; i < actions.length; i++) totals[i] += combos * frequencies[i]
+      }
+    }
+  }
+  if (totalCombos > 0) {
+    for (let i = 0; i < actions.length; i++) totals[i] /= totalCombos
+  }
+
+  return {
+    actorIndex: actor,
+    actions,
+    cells,
+    totals,
+    horizon: activeCount(ctx.root) === 2 ? 'river' : 'street',
+    iterations,
   }
 }

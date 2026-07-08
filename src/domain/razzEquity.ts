@@ -55,30 +55,43 @@ export interface RazzEquityResult {
 const KEY_LOW7 = 8 * 14 ** 4
 const KEY_LOW8 = 9 * 14 ** 4
 
-/** 入力の整合性チェック（枚数・重複・ジョーカー）。razzGame からも使う。 */
-export function validateRazzInput(input: RazzEquityInput): void {
-  const { street, seats, heroIndex, heroDown, dead = [] } = input
+/**
+ * 公開情報（席数・アップカード枚数・重複・ジョーカー）の整合性チェック。
+ * extra には伏せ札やデッドカードなど、重複チェックに含めたいカードを渡す。
+ * グリッドソルバー（Hero の実ハンドを固定しない解析）からも使う。
+ */
+export function validateRazzPublic(
+  street: RazzStreet,
+  seats: readonly RazzSeatInput[],
+  extra: readonly Card[] = [],
+): void {
   if (seats.length < 2 || seats.length > 6) {
     throw new Error(`razz: 2-6 players supported, got ${seats.length}`)
   }
-  if (heroIndex < 0 || heroIndex >= seats.length) throw new Error('razz: bad heroIndex')
   const upCount = razzUpCount(street)
   for (const [i, seat] of seats.entries()) {
     if (seat.up.length !== upCount) {
       throw new Error(`razz: seat ${i} needs ${upCount} upcards on street ${street}, got ${seat.up.length}`)
     }
   }
-  const downCount = razzDownCount(street)
-  if (heroDown.length !== downCount) {
-    throw new Error(`razz: hero needs ${downCount} downcards on street ${street}, got ${heroDown.length}`)
-  }
   const seen = new Set<number>()
-  for (const c of [...seats.flatMap((s) => s.up), ...heroDown, ...dead]) {
+  for (const c of [...seats.flatMap((s) => s.up), ...extra]) {
     razzRank(c) // ジョーカー検出
     const id = cardId(c)
     if (seen.has(id)) throw new Error(`razz: duplicate card ${cardToString(c)}`)
     seen.add(id)
   }
+}
+
+/** 入力の整合性チェック（枚数・重複・ジョーカー）。razzGame からも使う。 */
+export function validateRazzInput(input: RazzEquityInput): void {
+  const { street, seats, heroIndex, heroDown, dead = [] } = input
+  if (heroIndex < 0 || heroIndex >= seats.length) throw new Error('razz: bad heroIndex')
+  const downCount = razzDownCount(street)
+  if (heroDown.length !== downCount) {
+    throw new Error(`razz: hero needs ${downCount} downcards on street ${street}, got ${heroDown.length}`)
+  }
+  validateRazzPublic(street, seats, [...heroDown, ...dead])
 }
 
 /** Hero のショーダウンエクイティをモンテカルロで推定する。 */

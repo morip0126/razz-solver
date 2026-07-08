@@ -106,6 +106,8 @@ function traverse<TDeal, TState>(
 export interface McCfrOptions {
   iterations: number
   rng?: () => number
+  /** 学習の進捗通知（約1%刻み）。Web Worker から UI へ進捗を返すために使う。 */
+  onProgress?: (done: number, total: number) => void
 }
 
 /** external sampling MCCFR を実行し、蓄積した解を返す。 */
@@ -115,10 +117,14 @@ export function runMccfr<TDeal, TState>(
 ): CfrSolution {
   const rng = opts.rng ?? Math.random
   const sol: CfrSolution = { nodes: new Map() }
+  const step = opts.onProgress ? Math.max(1, Math.ceil(opts.iterations / 100)) : 0
   for (let it = 0; it < opts.iterations; it++) {
     for (let p = 0; p < game.numPlayers; p++) {
       const deal = game.sampleDeal(rng)
       traverse(game, sol, game.initialState(deal), deal, p, rng)
+    }
+    if (step && ((it + 1) % step === 0 || it + 1 === opts.iterations)) {
+      opts.onProgress!(it + 1, opts.iterations)
     }
   }
   return sol
