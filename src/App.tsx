@@ -7,6 +7,9 @@ import {
   parseCard,
   razzBringInIndex,
 } from './domain'
+// ?worker&inline: Worker コードを本体バンドルへ埋め込む（単一ファイル配布・
+// GitHub Pages 以外の静的ホスティングでもパス解決不要にするため）
+import SolverWorker from './worker/solverWorker?worker&inline'
 import type { SolveGridRequest, SolverResponse } from './worker/solverWorker'
 import { type Lang, type MessageKey, t } from './i18n'
 
@@ -86,9 +89,14 @@ function useGridSolver() {
 
   const solve = useCallback((spot: RazzGridSpot, iterations: number) => {
     workerRef.current?.terminate()
-    const worker = new Worker(new URL('./worker/solverWorker.ts', import.meta.url), {
-      type: 'module',
-    })
+    let worker: Worker
+    try {
+      worker = new SolverWorker()
+    } catch (err) {
+      // Worker が使えない環境（CSP 等）ではエラー表示に落とす
+      setState({ status: 'error', message: err instanceof Error ? err.message : String(err) })
+      return
+    }
     workerRef.current = worker
     const id = ++idRef.current
     setState({ status: 'solving', progress: 0 })
