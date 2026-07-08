@@ -44,10 +44,12 @@ const GROUP_COLOR = {
 } as const
 
 const PRESETS = [
-  { key: 'presetFast', iterations: 3000 },
-  { key: 'presetStandard', iterations: 10000 },
-  { key: 'presetFine', iterations: 30000 },
-] as const satisfies readonly { key: MessageKey; iterations: number }[]
+  { key: 'presetFast', iterations: 3000, rootExact: false },
+  { key: 'presetStandard', iterations: 10000, rootExact: false },
+  { key: 'presetFine', iterations: 30000, rootExact: false },
+  // 手番ストリートをバケットではなく正確な91ランクペアで解く（収束に多くの反復が要る）
+  { key: 'presetExact', iterations: 40000, rootExact: true },
+] as const satisfies readonly { key: MessageKey; iterations: number; rootExact: boolean }[]
 
 interface StakesInput {
   ante: string
@@ -113,7 +115,7 @@ function useGridSolver() {
   const idRef = useRef(0)
   const [state, setState] = useState<SolverState>({ status: 'idle' })
 
-  const solve = useCallback((spot: RazzGridSpot, iterations: number) => {
+  const solve = useCallback((spot: RazzGridSpot, iterations: number, rootExact: boolean) => {
     workerRef.current?.terminate()
     let worker: Worker
     try {
@@ -133,7 +135,7 @@ function useGridSolver() {
       else if (msg.type === 'result') setState({ status: 'done', result: msg.result })
       else setState({ status: 'error', message: msg.message })
     }
-    const req: SolveGridRequest = { id, spot, iterations }
+    const req: SolveGridRequest = { id, spot, iterations, rootExact }
     worker.postMessage(req)
   }, [])
 
@@ -162,7 +164,7 @@ export default function App() {
   const [players, setPlayers] = useState(6)
   const [upRanks, setUpRanks] = useState<string[]>(['J', 'T', '7', '6', '8', 'K'])
   const [stakes, setStakes] = useState<StakesInput>({ ante: '1', bringIn: '2', smallBet: '4', bigBet: '8' })
-  const [iterations, setIterations] = useState<number>(PRESETS[1].iterations)
+  const [presetIdx, setPresetIdx] = useState(1)
   const [history, setHistory] = useState('')
   // 表示中の結果に対応する入力（結果ヘッダ表示と、頻度ボタンの同期判定に使う）
   const [solvedCtx, setSolvedCtx] = useState<{ upRanks: string[]; history: string } | null>(null)
@@ -192,8 +194,13 @@ export default function App() {
 
   const runSolve = (hist: string) => {
     if (!parsed.seats || !stakesNum) return
+    const preset = PRESETS[presetIdx]
     setSolvedCtx({ upRanks: ranks, history: hist })
-    solve({ street: 3, seats: parsed.seats, stakes: stakesNum, history: hist }, iterations)
+    solve(
+      { street: 3, seats: parsed.seats, stakes: stakesNum, history: hist },
+      preset.iterations,
+      preset.rootExact,
+    )
   }
 
   /** アクションを 1 手進める。fromResult=true（頻度ボタン）は続きも自動計算する。 */
@@ -274,9 +281,9 @@ export default function App() {
           </label>
           <label className="field">
             <span>{t(lang, 'precision')}</span>
-            <select value={iterations} onChange={(e) => setIterations(Number(e.target.value))}>
-              {PRESETS.map((p) => (
-                <option key={p.key} value={p.iterations}>{t(lang, p.key)}</option>
+            <select value={presetIdx} onChange={(e) => setPresetIdx(Number(e.target.value))}>
+              {PRESETS.map((p, i) => (
+                <option key={p.key} value={i}>{t(lang, p.key)}</option>
               ))}
             </select>
           </label>
@@ -475,7 +482,7 @@ export default function App() {
             ))}
           </div>
 
-          <p className="hint">{t(lang, 'noteAbstraction')}</p>
+          <p className="hint">{t(lang, result.rootExact ? 'noteExact' : 'noteAbstraction')}</p>
         </section>
       )}
     </main>

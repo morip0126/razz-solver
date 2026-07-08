@@ -88,6 +88,24 @@ describe('solveRazzRangeGrid', () => {
     expect(r.actorIndex).toBe(3)
   })
 
+  it('rootExact: 同一バケットのランクペアが独立した戦略になる', () => {
+    // (A,2)+K と (A,3)+K は同じバケット（未完成ペアなし・低札2枚）
+    const rb = solveRazzRangeGrid(GRID_SPOT, { iterations: 500, rng: mulberry32(8) })
+    expect(rb.rootExact).toBe(false)
+    expect(cell(rb, 1, 2).frequencies).toEqual(cell(rb, 1, 3).frequencies)
+
+    // 正確表現では別の情報集合として学習される
+    const r = solveRazzRangeGrid(GRID_SPOT, {
+      iterations: 4000,
+      rng: mulberry32(7),
+      rootExact: true,
+    })
+    expect(r.rootExact).toBe(true)
+    expect(cell(r, 1, 2).frequencies).not.toEqual(cell(r, 1, 3).frequencies)
+    // 定性は維持: 強い伏せ札の方がフォールドが少ない
+    expect(freq(r, cell(r, 1, 2), 'fold')).toBeLessThan(freq(r, cell(r, 11, 12), 'fold'))
+  })
+
   it('入力検証: 7th 非対応、ハンド終了後の履歴はエラー', () => {
     expect(() =>
       solveRazzRangeGrid({ ...GRID_SPOT, street: 7 }, { iterations: 10 }),

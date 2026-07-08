@@ -40,6 +40,7 @@ const messages = {
   presetFast: { ja: '速い', en: 'Fast' },
   presetStandard: { ja: '標準', en: 'Standard' },
   presetFine: { ja: '高精度', en: 'Fine' },
+  presetExact: { ja: '最高精度（正確・重い）', en: 'Exact (slow)' },
   go: { ja: '計算', en: 'Go' },
   solving: { ja: '計算中… {pct}%', en: 'Solving… {pct}%' },
   previous: { ja: '戻る', en: 'Previous' },
@@ -80,6 +81,10 @@ const messages = {
   noteAbstraction: {
     ja: 'ハンドはバケット抽象化されるため、同じバケットのセルは同じ戦略になります。スートは自動割り当てです。',
     en: 'Hands are bucket-abstracted, so cells in the same bucket share a strategy. Suits are auto-assigned.',
+  },
+  noteExact: {
+    ja: '手番ストリートはランクペアごとに正確に計算しています（以降のストリートはバケット抽象化）。スートは自動割り当てです。',
+    en: 'The current street is solved exactly per rank pair (later streets remain bucket-abstracted). Suits are auto-assigned.',
   },
 } as const
 

@@ -106,6 +106,13 @@ export interface RazzSolveOptions {
   range?: RazzRangeModel
   /** MCCFR 学習の進捗通知（約1%刻み）。Worker から UI へ返す用。 */
   onProgress?: (done: number, total: number) => void
+  /**
+   * ルート（手番）ストリートの情報集合をバケットではなく正確な伏せ札ランクで区別する。
+   * Razz はスート無関係なので手番ストリートに関しては損失のない表現になるが、
+   * 情報集合が増えるぶん収束に多くの反復（目安 3〜5 倍）が必要。将来ストリートは
+   * 従来どおりバケット抽象化のまま。既定 false。
+   */
+  rootExact?: boolean
 }
 
 /**
@@ -149,6 +156,8 @@ export interface RazzGridResult {
   totals: number[]
   horizon: 'river' | 'street'
   iterations: number
+  /** true = 手番ストリートを正確な伏せ札ランクで解いた（セルごとに独立の戦略）。 */
+  rootExact: boolean
 }
 
 // ---- 内部状態 -------------------------------------------------------------------
@@ -189,6 +198,8 @@ interface SpotCtx {
   stakes: Required<RazzStakes>
   horizon: number
   root: BetState
+  /** ルートストリートの情報集合をバケットではなく正確な伏せ札ランクで区別する。 */
+  rootExact: boolean
   range: RazzRangeModel
   /** 学習用プール（Hero の伏せ札もサンプル対象に含める）。 */
   trainPool: Card[]
@@ -440,6 +451,17 @@ function utilityOf(state: BetState, deal: RazzDeal, player: number): number {
   return state.pot / winners - state.afterRoot[player]
 }
 
+/**
+ * ルートストリート用の正確な伏せ札キー（ランク昇順）。アップカードは公開情報なので、
+ * 伏せ札のランク多重集合で自分のハンドを損失なく識別できる（Razz はスート無関係）。
+ */
+function exactDownKey(hand: readonly Card[], street: number): string {
+  const ranks = [razzRank(hand[0]), razzRank(hand[1])]
+  if (street === 7) ranks.push(razzRank(hand[6]))
+  ranks.sort((a, b) => a - b)
+  return `e${ranks.join('.')}`
+}
+
 function infosetKeyOf(state: BetState, deal: RazzDeal, ctx: SpotCtx): string {
   const p = state.actor
   const idx = state.street - 3
@@ -448,7 +470,11 @@ function infosetKeyOf(state: BetState, deal: RazzDeal, ctx: SpotCtx): string {
     if (i === p) continue
     tiers += state.folded[i] ? 'F' : String(deal.boardTiers[i][idx])
   }
-  return `${state.street}|${state.hist}|${deal.buckets[p][idx]}|${tiers}`
+  const own =
+    ctx.rootExact && state.street === ctx.root.street
+      ? exactDownKey(deal.hands[p], state.street)
+      : String(deal.buckets[p][idx])
+  return `${state.street}|${state.hist}|${own}|${tiers}`
 }
 
 // ---- 配札サンプリング -----------------------------------------------------------
@@ -566,6 +592,7 @@ function buildCtx(input: BuildInput, opts: RazzSolveOptions): SpotCtx {
     stakes,
     horizon: 7, // リプレイでは未使用（現在ストリート内のみ）。後で確定する。
     root: state,
+    rootExact: opts.rootExact ?? false,
     range,
     trainPool: [],
     evalPool: [],
@@ -753,9 +780,10 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
     for (let r2 = r1; r2 <= 13; r2++) {
       const combos =
         r1 === r2 ? (avail[r1] * (avail[r1] - 1)) / 2 : avail[r1] * avail[r2]
-      const hand = [cardOfRazzRank(r1), cardOfRazzRank(r2), ...ctx.seats[actor].up]
-      const bucket = razzHandBucket(hand)
-      const key = `${ctx.root.street}|${ctx.root.hist}|${bucket}|${tiers}`
+      const own = ctx.rootExact
+        ? `e${r1}.${r2}`
+        : String(razzHandBucket([cardOfRazzRank(r1), cardOfRazzRank(r2), ...ctx.seats[actor].up]))
+      const key = `${ctx.root.street}|${ctx.root.hist}|${own}|${tiers}`
       const frequencies = averageStrategy(sol, key, actions.length)
       cells.push({ ranks: [r1, r2], combos, frequencies })
       if (combos > 0) {
@@ -775,6 +803,7 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
     totals,
     horizon: activeCount(ctx.root) === 2 ? 'river' : 'street',
     iterations,
+    rootExact: ctx.rootExact,
   }
 }
 
@@ -853,6 +882,7 @@ export function replayRazzHistory(spot: RazzGridSpot): RazzHistoryReplay {
     stakes,
     horizon: spot.street,
     root: state,
+    rootExact: false,
     range: DEFAULT_RAZZ_RANGE,
     trainPool: [],
     evalPool: [],
