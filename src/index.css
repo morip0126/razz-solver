@@ -170,6 +170,111 @@ button {
   min-width: 70px;
 }
 
+/* ---- アクションビルダー ---- */
+
+.pos-field.folded {
+  opacity: 0.4;
+}
+
+.pos-field.folded .rank-input {
+  text-decoration: line-through;
+}
+
+.pos-field.acting .rank-input {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.action-builder {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  margin-bottom: 10px;
+}
+
+.section-label {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+
+.timeline {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.step-chip {
+  font-size: 12px;
+  border-radius: 999px;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  background: var(--panel2);
+  white-space: nowrap;
+}
+
+.step-chip b {
+  font-weight: 700;
+}
+
+.step-chip.step-fold {
+  border-color: var(--act-fold);
+  background: color-mix(in srgb, var(--act-fold) 22%, var(--panel));
+}
+
+.step-chip.step-call {
+  border-color: var(--act-call);
+  background: color-mix(in srgb, var(--act-call) 22%, var(--panel));
+}
+
+.step-chip.step-raise {
+  border-color: var(--act-raise);
+  background: color-mix(in srgb, var(--act-raise) 22%, var(--panel));
+}
+
+.next-line {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+}
+
+.pot-info {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.builder-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.builder-nav {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.builder-nav .nav-button {
+  flex: none;
+  padding: 7px 14px;
+  font-size: 13px;
+}
+
+.done-note {
+  font-weight: 600;
+}
+
+.stale-note {
+  margin-top: 10px;
+  color: var(--error);
+}
+
 .num-input,
 .history-input {
   width: 100%;

@@ -11,10 +11,26 @@ const messages = {
   players: { ja: '人数', en: 'Players' },
   position: { ja: 'Pos {n}', en: 'Pos {n}' },
   bringInBadge: { ja: 'BI', en: 'BI' },
-  history: { ja: '履歴', en: 'History' },
-  historyHint: {
-    ja: 'f=フォールド c=コール/チェック r=レイズ/コンプリート（例: ffffr）',
-    en: 'f=fold c=call/check r=raise/complete (e.g. ffffr)',
+  actionsLabel: { ja: 'アクション', en: 'Actions' },
+  nextToAct: {
+    ja: '次の手番: Pos {n}（{card}）',
+    en: 'Next to act: Pos {n} ({card})',
+  },
+  potLabel: { ja: 'ポット {n}', en: 'Pot {n}' },
+  toCallLabel: { ja: 'コール {n}', en: 'To call {n}' },
+  undo: { ja: '1手戻す', en: 'Undo' },
+  reset: { ja: 'リセット', en: 'Reset' },
+  handOver: {
+    ja: 'ハンド終了（1人を残して全員フォールド）',
+    en: 'Hand over (everyone folded to one player)',
+  },
+  streetClosed: {
+    ja: 'このストリートのベッティングは終了しました（続きの入力は非対応）',
+    en: 'Betting on this street is closed (later streets not supported)',
+  },
+  staleResult: {
+    ja: '入力が変更されています。「計算」で結果を更新してください。',
+    en: 'Inputs have changed. Press Go to refresh the result.',
   },
   ante: { ja: 'アンティ', en: 'Ante' },
   bringInAmount: { ja: 'ブリングイン', en: 'Bring-in' },

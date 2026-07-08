@@ -777,3 +777,116 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
     iterations,
   }
 }
+
+// ---- 履歴リプレイ（UI のアクションビルダー用） ------------------------------------
+
+export interface RazzHistoryStep {
+  seatIndex: number
+  action: RazzActionLabel
+}
+
+export interface RazzHistoryReplay {
+  /** 解決できた履歴（行動順）。 */
+  steps: RazzHistoryStep[]
+  /** 次に行動する席（ハンド / ストリート終了時は -1）。 */
+  actorIndex: number
+  /** 手番プレイヤーの合法アクション（終了時は空）。 */
+  legalActions: RazzActionLabel[]
+  /** true = これ以上入力できない（フォールド勝ち or 現在ストリートのベッティング終了）。 */
+  done: boolean
+  /** 現在のポット（現在ストリートの投入分・ブリングイン込み）。 */
+  pot: number
+  /** 手番プレイヤーがコールに必要な額（終了時は 0）。 */
+  toCall: number
+  /** 3rd street のブリングイン席（それ以外は -1）。 */
+  bringInIndex: number
+  folded: boolean[]
+  /** 解決できないアクションがあった履歴位置（なければ -1）。steps はその直前まで。 */
+  invalidAt: number
+}
+
+/**
+ * MCCFR なしで履歴だけをリプレイし、手番・合法アクション・ポットを返す。
+ * UI のアクション入力（ステップ入力・タイムライン表示）用の軽量ヘルパー。
+ * 現在ストリートのベッティングが閉じた時点で done になる（次ストリートは非対応）。
+ */
+export function replayRazzHistory(spot: RazzGridSpot): RazzHistoryReplay {
+  validateRazzPublic(spot.street, spot.seats, spot.dead ?? [])
+  const stakes: Required<RazzStakes> = { raiseCap: 4, ...spot.stakes }
+  if (stakes.ante < 0 || stakes.bringIn <= 0 || stakes.smallBet <= 0 || stakes.bigBet <= 0) {
+    throw new Error('razz: stakes must be positive')
+  }
+  if (stakes.bringIn >= stakes.smallBet) {
+    throw new Error('razz: bringIn must be smaller than smallBet')
+  }
+  const n = spot.seats.length
+  const state: BetState = {
+    street: spot.street,
+    pot: spot.pot ?? stakes.ante * n,
+    contrib: new Array(n).fill(0),
+    afterRoot: new Array(n).fill(0),
+    folded: new Array(n).fill(false),
+    pending: new Array(n).fill(true),
+    betLevel: 0,
+    raises: 0,
+    actor: -1,
+    done: false,
+    winner: -1,
+    hist: '',
+  }
+  let bringInIndex = -1
+  if (spot.street === 3) {
+    bringInIndex = spot.bringInIndex ?? razzBringInIndex(spot.seats)
+    state.contrib[bringInIndex] = stakes.bringIn
+    state.betLevel = stakes.bringIn
+    state.actor = (bringInIndex + 1) % n
+  } else {
+    state.actor = firstToActFromUps(spot.seats.map((s) => s.up), state.folded)
+  }
+
+  // horizon = 現在ストリート（ベッティングが閉じたら done。applyAction は deal 不要）
+  const ctx: SpotCtx = {
+    seats: spot.seats,
+    n,
+    heroIndex: -1,
+    heroDown: [],
+    stakes,
+    horizon: spot.street,
+    root: state,
+    range: DEFAULT_RAZZ_RANGE,
+    trainPool: [],
+    evalPool: [],
+    seatWeights: [],
+  }
+
+  const chars = historyChars(spot.history)
+  const steps: RazzHistoryStep[] = []
+  let cur = state
+  let invalidAt = -1
+  for (const [i, raw] of chars.entries()) {
+    if (cur.done || cur.actor < 0) {
+      invalidAt = i
+      break
+    }
+    const action = coerceRazzAction(raw, legalActionsOf(cur, ctx))
+    if (!action) {
+      invalidAt = i
+      break
+    }
+    steps.push({ seatIndex: cur.actor, action })
+    cur = applyAction(cur, ctx, null, action)
+  }
+
+  const done = cur.done || cur.actor < 0
+  return {
+    steps,
+    actorIndex: done ? -1 : cur.actor,
+    legalActions: done ? [] : legalActionsOf(cur, ctx),
+    done,
+    pot: cur.pot + cur.contrib.reduce((x, y) => x + y, 0),
+    toCall: done ? 0 : cur.betLevel - cur.contrib[cur.actor],
+    bringInIndex,
+    folded: [...cur.folded],
+    invalidAt,
+  }
+}

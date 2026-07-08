@@ -4,8 +4,9 @@ import {
   type RazzActionLabel,
   type RazzGridResult,
   type RazzGridSpot,
+  type RazzHistoryReplay,
   parseCard,
-  razzBringInIndex,
+  replayRazzHistory,
 } from './domain'
 // ?worker&inline: Worker コードを本体バンドルへ埋め込む（単一ファイル配布・
 // GitHub Pages 以外の静的ホスティングでもパス解決不要にするため）
@@ -53,6 +54,31 @@ interface StakesInput {
   bringIn: string
   smallBet: string
   bigBet: string
+}
+
+interface StakesNum {
+  ante: number
+  bringIn: number
+  smallBet: number
+  bigBet: number
+}
+
+function parseStakes(s: StakesInput): StakesNum | null {
+  const v: StakesNum = {
+    ante: Number(s.ante),
+    bringIn: Number(s.bringIn),
+    smallBet: Number(s.smallBet),
+    bigBet: Number(s.bigBet),
+  }
+  if (
+    !Number.isFinite(v.ante) || !Number.isFinite(v.bringIn) ||
+    !Number.isFinite(v.smallBet) || !Number.isFinite(v.bigBet) ||
+    v.ante < 0 || v.bringIn <= 0 || v.smallBet <= 0 || v.bigBet <= 0 ||
+    v.bringIn >= v.smallBet
+  ) {
+    return null
+  }
+  return v
 }
 
 /**
@@ -137,47 +163,55 @@ export default function App() {
   const [upRanks, setUpRanks] = useState<string[]>(['J', 'T', '7', '6', '8', 'K'])
   const [stakes, setStakes] = useState<StakesInput>({ ante: '1', bringIn: '2', smallBet: '4', bigBet: '8' })
   const [iterations, setIterations] = useState<number>(PRESETS[1].iterations)
-  const [history, setHistory] = useState('ffffr')
-  const [inputError, setInputError] = useState<string | null>(null)
-  // 表示中の結果に対応する入力（結果ヘッダの Pos / カード表示に使う）
-  const [solvedCtx, setSolvedCtx] = useState<{ upRanks: string[] } | null>(null)
+  const [history, setHistory] = useState('')
+  // 表示中の結果に対応する入力（結果ヘッダ表示と、頻度ボタンの同期判定に使う）
+  const [solvedCtx, setSolvedCtx] = useState<{ upRanks: string[]; history: string } | null>(null)
   const { state, solve } = useGridSolver()
 
   const ranks = upRanks.slice(0, players)
   const parsed = seatsFromRanks(ranks, lang)
-  const bringIn = parsed.seats ? razzBringInIndex(parsed.seats) : -1
+  const stakesNum = parseStakes(stakes)
+
+  // 履歴のリプレイ（手番・合法アクション・ポット）。入力が不完全な間は null。
+  let replay: RazzHistoryReplay | null = null
+  if (parsed.seats && stakesNum) {
+    try {
+      replay = replayRazzHistory({ street: 3, seats: parsed.seats, stakes: stakesNum, history })
+    } catch {
+      replay = null
+    }
+  }
+
+  // アップカード変更などで履歴が不正になったら、有効な部分まで切り詰める
+  useEffect(() => {
+    if (replay && replay.invalidAt >= 0) {
+      const valid = replay.steps.length
+      setHistory((h) => h.slice(0, valid))
+    }
+  })
 
   const runSolve = (hist: string) => {
-    setInputError(null)
-    const { seats, error } = seatsFromRanks(ranks, lang)
-    if (!seats) {
-      setInputError(error ?? '')
-      return
-    }
-    const s = {
-      ante: Number(stakes.ante),
-      bringIn: Number(stakes.bringIn),
-      smallBet: Number(stakes.smallBet),
-      bigBet: Number(stakes.bigBet),
-    }
-    if (
-      !Number.isFinite(s.ante) || !Number.isFinite(s.bringIn) ||
-      !Number.isFinite(s.smallBet) || !Number.isFinite(s.bigBet) ||
-      s.ante < 0 || s.bringIn <= 0 || s.smallBet <= 0 || s.bigBet <= 0 ||
-      s.bringIn >= s.smallBet
-    ) {
-      setInputError(t(lang, 'errStakes'))
-      return
-    }
-    setSolvedCtx({ upRanks: ranks })
-    solve({ street: 3, seats, stakes: s, history: hist }, iterations)
+    if (!parsed.seats || !stakesNum) return
+    setSolvedCtx({ upRanks: ranks, history: hist })
+    solve({ street: 3, seats: parsed.seats, stakes: stakesNum, history: hist }, iterations)
   }
 
-  const onAction = (action: RazzActionLabel) => {
+  /** アクションを 1 手進める。fromResult=true（頻度ボタン）は続きも自動計算する。 */
+  const pushAction = (action: RazzActionLabel, fromResult: boolean) => {
+    if (!parsed.seats || !stakesNum) return
     const next = history + ACTION_TO_CHAR[action]
     setHistory(next)
-    runSolve(next)
+    if (!fromResult) return
+    try {
+      const nr = replayRazzHistory({ street: 3, seats: parsed.seats, stakes: stakesNum, history: next })
+      if (!nr.done) runSolve(next)
+    } catch {
+      // 入力が壊れている場合は何もしない（ビルダー側にエラー表示が出る）
+    }
   }
+
+  const undo = () => setHistory((h) => h.slice(0, -1))
+  const reset = () => setHistory('')
 
   const onPrevious = () => {
     if (history.length === 0) return
@@ -187,10 +221,18 @@ export default function App() {
   }
 
   const result = state.status === 'done' ? state.result : null
+  // 表示中の結果と現在の入力が一致しているか（不一致なら頻度ボタンを無効化）
+  const inSync =
+    solvedCtx != null &&
+    solvedCtx.history === history &&
+    solvedCtx.upRanks.join() === ranks.join()
   const cellMap = new Map<string, { combos: number; frequencies: number[] }>()
   if (result) {
     for (const c of result.cells) cellMap.set(`${c.ranks[0]}-${c.ranks[1]}`, c)
   }
+
+  const inputError = parsed.error ?? (stakesNum ? null : t(lang, 'errStakes'))
+  const foldWin = replay?.done && replay.folded.filter((f) => !f).length === 1
 
   return (
     <main className="app">
@@ -222,6 +264,7 @@ export default function App() {
                   while (next.length < n) next.push('')
                   return next
                 })
+                setHistory('')
               }}
             >
               {[2, 3, 4, 5, 6].map((n) => (
@@ -229,27 +272,40 @@ export default function App() {
               ))}
             </select>
           </label>
+          <label className="field">
+            <span>{t(lang, 'precision')}</span>
+            <select value={iterations} onChange={(e) => setIterations(Number(e.target.value))}>
+              {PRESETS.map((p) => (
+                <option key={p.key} value={p.iterations}>{t(lang, p.key)}</option>
+              ))}
+            </select>
+          </label>
         </div>
 
         <div className="positions">
-          {ranks.map((r, i) => (
-            <label key={i} className="field pos-field">
-              <span>
-                {t(lang, 'position', { n: i + 1 })}
-                {i === bringIn && <em className="bi-badge">{t(lang, 'bringInBadge')}</em>}
-              </span>
-              <input
-                className="rank-input"
-                value={r}
-                maxLength={1}
-                inputMode="text"
-                onChange={(e) => {
-                  const v = e.target.value.toUpperCase()
-                  setUpRanks((prev) => prev.map((x, j) => (j === i ? v : x)))
-                }}
-              />
-            </label>
-          ))}
+          {ranks.map((r, i) => {
+            const classes = ['field', 'pos-field']
+            if (replay?.folded[i]) classes.push('folded')
+            if (replay?.actorIndex === i) classes.push('acting')
+            return (
+              <label key={i} className={classes.join(' ')}>
+                <span>
+                  {t(lang, 'position', { n: i + 1 })}
+                  {i === replay?.bringInIndex && <em className="bi-badge">{t(lang, 'bringInBadge')}</em>}
+                </span>
+                <input
+                  className="rank-input"
+                  value={r}
+                  maxLength={1}
+                  inputMode="text"
+                  onChange={(e) => {
+                    const v = e.target.value.toUpperCase()
+                    setUpRanks((prev) => prev.map((x, j) => (j === i ? v : x)))
+                  }}
+                />
+              </label>
+            )
+          })}
         </div>
 
         <div className="row stakes-row">
@@ -266,31 +322,70 @@ export default function App() {
           ))}
         </div>
 
-        <div className="row">
-          <label className="field grow">
-            <span>{t(lang, 'history')}</span>
-            <input
-              className="history-input"
-              value={history}
-              placeholder="ffffr"
-              onChange={(e) => setHistory(e.target.value.toLowerCase().replace(/[^fckxbpr]/g, ''))}
-            />
-          </label>
-          <label className="field">
-            <span>{t(lang, 'precision')}</span>
-            <select value={iterations} onChange={(e) => setIterations(Number(e.target.value))}>
-              {PRESETS.map((p) => (
-                <option key={p.key} value={p.iterations}>{t(lang, p.key)}</option>
+        <div className="action-builder">
+          <p className="section-label">{t(lang, 'actionsLabel')}</p>
+
+          {replay && replay.steps.length > 0 && (
+            <div className="timeline">
+              {replay.steps.map((s, i) => (
+                <span key={i} className={`step-chip step-${actionGroup(s.action)}`}>
+                  <b>{t(lang, 'position', { n: s.seatIndex + 1 })}</b>
+                  {' '}{ranks[s.seatIndex]}{' '}
+                  {t(lang, ACTION_LABEL_KEY[s.action])}
+                </span>
               ))}
-            </select>
-          </label>
+            </div>
+          )}
+
+          {replay && !replay.done && (
+            <>
+              <p className="next-line">
+                {t(lang, 'nextToAct', {
+                  n: replay.actorIndex + 1,
+                  card: ranks[replay.actorIndex],
+                })}
+                <span className="pot-info">
+                  {t(lang, 'potLabel', { n: replay.pot })}
+                  {replay.toCall > 0 && <> ・ {t(lang, 'toCallLabel', { n: replay.toCall })}</>}
+                </span>
+              </p>
+              <div className="builder-buttons">
+                {replay.legalActions.map((a) => (
+                  <button
+                    key={a}
+                    type="button"
+                    className={`action-button act-${actionGroup(a)}`}
+                    onClick={() => pushAction(a, false)}
+                  >
+                    {t(lang, ACTION_LABEL_KEY[a])}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
+          {replay?.done && (
+            <p className="hint done-note">
+              {t(lang, foldWin ? 'handOver' : 'streetClosed')}
+            </p>
+          )}
+
+          {history.length > 0 && (
+            <div className="builder-nav">
+              <button type="button" className="nav-button" onClick={undo}>
+                {t(lang, 'undo')}
+              </button>
+              <button type="button" className="nav-button" onClick={reset}>
+                {t(lang, 'reset')}
+              </button>
+            </div>
+          )}
         </div>
-        <p className="hint">{t(lang, 'historyHint')}</p>
 
         <button
           type="button"
           className="go-button"
-          disabled={state.status === 'solving'}
+          disabled={state.status === 'solving' || !replay || replay.done}
           onClick={() => runSolve(history)}
         >
           {state.status === 'solving'
@@ -303,16 +398,7 @@ export default function App() {
           </div>
         )}
         {inputError && <p className="error">{inputError}</p>}
-        {state.status === 'error' && (
-          <p className="error">
-            {state.message}
-            {history.length > 0 && (
-              <button type="button" className="nav-button inline" onClick={onPrevious}>
-                {t(lang, 'previous')}
-              </button>
-            )}
-          </p>
-        )}
+        {state.status === 'error' && <p className="error">{state.message}</p>}
       </section>
 
       {result && (
@@ -365,6 +451,8 @@ export default function App() {
             <span><i className="swatch" style={{ background: 'var(--act-raise)' }} />{t(lang, 'legendRaise')}</span>
           </div>
 
+          {!inSync && <p className="hint stale-note">{t(lang, 'staleResult')}</p>}
+
           <div className="action-bar">
             <button
               type="button"
@@ -379,8 +467,8 @@ export default function App() {
                 key={a}
                 type="button"
                 className={`action-button act-${actionGroup(a)}`}
-                disabled={state.status === 'solving'}
-                onClick={() => onAction(a)}
+                disabled={state.status === 'solving' || !inSync}
+                onClick={() => pushAction(a, true)}
               >
                 {t(lang, ACTION_LABEL_KEY[a])} {(result.totals[i] * 100).toFixed(0)}%
               </button>

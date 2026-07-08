@@ -7,6 +7,7 @@ import { mulberry32 } from './combinatorics'
 import {
   type RazzGridSpot,
   coerceRazzAction,
+  replayRazzHistory,
   solveRazzRangeGrid,
 } from './razzGame'
 
@@ -98,6 +99,56 @@ describe('solveRazzRangeGrid', () => {
     expect(() =>
       solveRazzRangeGrid({ ...GRID_SPOT, history: 'zf' }, { iterations: 10 }),
     ).toThrow(/illegal/)
+  })
+})
+
+describe('replayRazzHistory', () => {
+  it('手番・合法アクション・ポットを追跡する', () => {
+    // ブリングイン = seat 5 (K)。履歴なし → seat 0 が最初の手番
+    const r0 = replayRazzHistory({ ...GRID_SPOT, history: '' })
+    expect(r0.bringInIndex).toBe(5)
+    expect(r0.actorIndex).toBe(0)
+    expect(r0.legalActions).toEqual(['fold', 'call', 'complete'])
+    expect(r0.pot).toBe(6 * 1 + 2) // ante × 6 + ブリングイン
+    expect(r0.toCall).toBe(2)
+    expect(r0.done).toBe(false)
+
+    // ffffr 後 → seat 5 がコンプリート(4)に直面
+    const r = replayRazzHistory(GRID_SPOT)
+    expect(r.steps).toEqual([
+      { seatIndex: 0, action: 'fold' },
+      { seatIndex: 1, action: 'fold' },
+      { seatIndex: 2, action: 'fold' },
+      { seatIndex: 3, action: 'fold' },
+      { seatIndex: 4, action: 'complete' },
+    ])
+    expect(r.actorIndex).toBe(5)
+    expect(r.legalActions).toEqual(['fold', 'call', 'raise'])
+    expect(r.pot).toBe(6 + 2 + 4)
+    expect(r.toCall).toBe(2) // ブリングイン 2 は投入済み → 追加 2
+    expect(r.folded).toEqual([true, true, true, true, false, false])
+  })
+
+  it('フォールド勝ち・ストリート終了で done になる', () => {
+    const win = replayRazzHistory({ ...GRID_SPOT, history: 'fffff' })
+    expect(win.done).toBe(true)
+    expect(win.actorIndex).toBe(-1)
+    expect(win.legalActions).toEqual([])
+    // ブリングインがコールしてストリート終了
+    const closed = replayRazzHistory({ ...GRID_SPOT, history: 'ffffrc' })
+    expect(closed.done).toBe(true)
+    expect(closed.pot).toBe(6 + 4 + 4)
+  })
+
+  it('不正なアクションは invalidAt を返し、それ以前は解決する', () => {
+    const r = replayRazzHistory({ ...GRID_SPOT, history: 'ffzf' })
+    expect(r.invalidAt).toBe(2)
+    expect(r.steps).toHaveLength(2)
+    expect(r.actorIndex).toBe(2)
+    // ハンド終了後に履歴が続く場合も invalidAt
+    const over = replayRazzHistory({ ...GRID_SPOT, history: 'fffffc' })
+    expect(over.invalidAt).toBe(5)
+    expect(over.done).toBe(true)
   })
 })
 
