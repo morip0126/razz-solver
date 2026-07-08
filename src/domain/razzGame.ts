@@ -489,11 +489,20 @@ function sampleRazzDeal(
   const pool = pool0.slice()
   const n = ctx.n
 
-  // 伏せ札（レンジ重み付き）。7th では 3 枚目の伏せ札は配られたばかりなので一様。
+  // 伏せ札。相手はレンジ重み付き、解析対象（Hero / 手番）自身は一様にサンプルする。
+  // 自札までレンジで偏らせると高札ハンドの情報集合がほぼ訪問されず学習されない
+  // （例: K アップの KK は A2 の約 1/400）。フォールドによるレンジの絞り込みは
+  // 戦略そのものが表現する。7th の 3 枚目は配られたばかりなので常に一様。
   const downs: Card[][] = new Array(n)
   for (let i = 0; i < n; i++) {
-    if (i === ctx.heroIndex && fixedHeroDown) {
-      downs[i] = [...fixedHeroDown]
+    if (i === ctx.heroIndex) {
+      if (fixedHeroDown) {
+        downs[i] = [...fixedHeroDown]
+        continue
+      }
+      const hidden = [drawUniform(pool, rng), drawUniform(pool, rng)]
+      if (street === 7) hidden.push(drawUniform(pool, rng))
+      downs[i] = hidden
       continue
     }
     const hidden = sampleHiddenCards(pool, 2, ctx.seatWeights[i], rng)
