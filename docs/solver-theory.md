@@ -1,0 +1,164 @@
+# ソルバーの理論的背景と精度問題の分析
+
+本リポジトリのソルバー（`src/domain/razzCfr.ts` + `razzGame.ts`）が依拠する理論を
+論文ベースで整理し、観測されている精度問題 —— **「絶対に降りないハンドにフォールド頻度が
+数%残る」「近い強さのハンド間で戦略の強弱が逆転する」** —— の原因と、文献に裏付けられた
+改善手段を記録する。
+
+## 1. 問題設定: 展開形ゲームとナッシュ均衡
+
+ポーカーは不完全情報の展開形ゲーム（extensive-form game）。プレイヤーは自分から区別できない
+局面の集合 = **情報集合**（information set）ごとに行動確率（戦略）を持つ。2人ゼロサムゲームでは
+ナッシュ均衡戦略が「相手が最善応答しても搾取されない」戦略であり、ソルバーの目標はその近似。
+近似の質は **exploitability**（最善応答を取られたときの損失、ε-均衡の ε）で測る。
+
+## 2. CFR: Counterfactual Regret Minimization（Zinkevich et al., NIPS 2007）
+
+- 各情報集合で「各アクションを取っていたら得られた counterfactual value と、実際の戦略の値の差」
+  = **カウンターファクチュアル・リグレット**を累積し、**regret matching**
+  （正のリグレットに比例した確率で行動）で戦略を更新する。
+- 全体リグレットは情報集合ごとの局所リグレットの和で抑えられ、T 反復後の平均リグレットは
+  `O(Δ·|I|·√|A| / √T)`（Δ=利得幅、|I|=情報集合数、|A|=アクション数）。
+- **収束するのは「平均戦略」（全反復の戦略の平均）** であり、2人ゼロサムなら平均戦略の
+  exploitability は `O(1/√T)` で 0 に近づく。各時点の「現在戦略」は収束しない（振動する）。
+
+### 2.1 なぜ「絶対に降りないハンド」にフォールド頻度が残るのか
+
+これは本実装のバグではなく、**vanilla CFR の平均戦略の既知の性質**である。
+
+1. **初期反復の混入**: regret matching はリグレット 0 の初期状態で一様戦略（3択なら各33%）から
+   始まる。真の均衡が純粋戦略（100%コール）でも、平均戦略には学習初期の一様な質量が残り、
+   均一平均では `O(初期反復数/T)` でしか薄まらない。40,000反復で数%のフォールドが残るのは
+   理論どおりの挙動で、「フォールドすべきと学習した」のではなく「まだ平均に混ざっている」。
+2. **MCCFR のサンプリング分散**（§3）: 訪問回数が少ない情報集合ではリグレット推定の分散が
+   大きく、EV 差が小さいハンド同士（例: 45 と 46）では収束前の順位が入れ替わって見える。
+   強弱の単調性違反はこの分散が原因で、反復を増やすと消える方向にしか動かない。
+3. **抽象化ギャップ**（§5）: 将来ストリートはバケット抽象化なので、境界ハンドの EV 自体に
+   モデル誤差があり、真に 50:50 に近い混合になることもある。
+
+つまり「低頻度アクションの残留」は主に (1)+(2) の収束アーティファクトであり、後述の
+加重平均（§4）と表示時の閾値処理（§4.3）が文献上の標準的な対処である。
+
+## 3. MCCFR: サンプリング版 CFR（Lanctot et al., NIPS 2009）
+
+ゲーム木全体を毎回走査する vanilla CFR に対し、MCCFR は配札や相手手番をサンプルして
+部分木だけを更新する。期待値では CFR と同じ更新になり、高確率で有界リグレット
+（確率 1−δ で `O(1/√T)` 収束）が保証される。
+
+- **external sampling（本実装が採用）**: 更新対象プレイヤーの手番では全アクションを展開し、
+  チャンス（配札）と相手の手番は現在戦略からサンプルする。1反復が軽い代わりに
+  **分散が増え、まれにしか訪問されない情報集合の収束が遅い**。
+- 本実装で起きた「K アップの KK がほぼ配られず未学習の一様分布のまま表示される」問題は、
+  この訪問頻度の偏りの極端な例（解析対象プレイヤーの伏せ札を一様サンプルに変更して解決済み）。
+
+## 4. 収束を速くする・ノイズを消す標準手法
+
+### 4.1 CFR+（Tammelin 2014; Bowling et al., Science 2015 / IJCAI 2015）
+
+ヘッズアップ・リミットホールデムを「実質的に解いた」（exploitability < 1 mbb/hand）アルゴリズム。
+vanilla CFR より実測1桁以上速い。3つの変更の組み合わせ:
+
+1. **regret-matching+**: 累積リグレットの負値を毎回 0 にクリップする（深く沈んだアクションが
+   復帰できないのを防ぎ、方向転換が速くなる）。
+2. **線形加重平均**: 平均戦略への反復 t の寄与を t に比例させる（後期の成熟した戦略を重視）。
+   → **§2.1 の「初期一様分布の残留」を直接解消する**。
+3. **交互更新**: プレイヤーごとに交互にリグレットを更新する（本実装は既に毎反復
+   全プレイヤーを traverser にしており実質同等）。
+
+注意: 素の CFR+ はサンプリング（MCCFR）と相性が悪いことが知られており、
+分散低減（§4.4）と組み合わせて初めてサンプリングでも機能する。
+regret-matching+ 単体と線形平均は MCCFR にもよく使われる。
+
+### 4.2 Linear CFR / Discounted CFR（Brown & Sandholm, AAAI 2019）
+
+割引で過去の寄与を減衰させる一般化。反復 t で:
+
+- 正の累積リグレットに `t^α/(t^α+1)`、負に `t^β/(t^β+1)` を乗じ、
+  平均戦略の寄与に `(t/(t+1))^γ` を乗じる。
+- **推奨パラメータは α=1.5, β=0, γ=2**（実験的に最良）。β=0 は regret-matching+ の
+  クリップに近い効果、γ=2 は二次加重平均で初期ノイズを強く減衰させる。
+- Linear CFR は α=β=γ=1 の特殊形。ポーカー系ゲームで CFR+ 同等以上の実用最速クラス。
+
+**本実装への示唆**: `razzCfr.ts` の `strategySum` への蓄積を反復番号で重み付けする
+（γ=2 相当）だけで、「純コールのはずのハンドに残るフォールド数%」は大幅に縮む。
+リグレット側の割引（α/β）も数行で入る。
+
+### 4.3 Purification / Thresholding（Ganzfried & Sandholm, AAMAS 2012）
+
+計算された（抽象ゲームの）均衡をそのまま使わず、**低確率アクションを閾値で切り捨てて
+再正規化**（thresholding）、または最頻アクションに丸める（purification）。
+実戦性能が向上する例が多く、**中間的な閾値はむしろ exploitability を下げることもある**
+と報告されている（抽象化への過適合とノイズの除去として働くため）。
+AAAI コンピュータポーカー大会の上位ボットも閾値 0.15 程度の thresholding を採用していた。
+
+**本実装への示唆**: 表示レイヤーで「頻度 < 3〜5% のアクションを 0 に丸めて再正規化」する
+だけで、ユーザーが観測した違和感（明らかな純コールに混ざるフォールド数%）は消える。
+理論的にも正当化される後処理である。
+
+### 4.4 VR-MCCFR: ベースラインによる分散低減（Schmid et al., AAAI 2019）
+
+政策勾配法の baseline / control variate と同じ発想で、サンプルされた counterfactual value を
+状態行動ベースラインで補正する。不偏のまま **経験分散を約3桁削減、収束を1〜2桁高速化**。
+分散が下がることで CFR+ をサンプリングと併用できるようになる。
+external sampling の「まれな局面が遅い」問題への最も根本的な文献解。
+
+## 5. 抽象化の理論と限界
+
+- フルゲームは巨大なので、実用ソルバーは必ず抽象化（カードのバケット化・ベットサイズの制限等）
+  の上で均衡を解く。本実装の抽象化: ハンド → 強さティア×低札数の64バケット、相手ボード →
+  6ティア、`rootExact` モードでは手番ストリートのみ正確なランク多重集合
+  （Razz はスートがハンド強度に無関係なので、この部分は**損失のない**表現）。
+- **abstraction pathology**（Waugh et al., AAMAS 2009): 「抽象化を細かくすれば full game での
+  戦略は単調に良くなる」は一般には**成り立たない**。細かい抽象化の均衡が粗い抽象化より
+  搾取されやすくなる反例が存在する。→ 細分化は「訪問回数が薄まる」コスト（§3）も伴うため、
+  反復数とセットで考える必要がある（今回 rootExact で反復を 30k→40k に増やしたのはこのため)。
+- 対処の研究として CFR-BR（抽象化内で full-game 最良応答に対して最適化）などがある。
+
+## 6. 本実装の現状と症状→手法の対応表
+
+| 観測される症状 | 原因（§） | 文献上の対処 | 実装コスト |
+|---|---|---|---|
+| 純コールのはずのハンドにフォールド数%が残る | §2.1 初期反復の混入 | 平均戦略の線形/二次加重（CFR+ / DCFR γ=2） | 小（数行） |
+| 同上（表示上の違和感） | §2.1 | thresholding（<3〜5%を丸め） | 小（UI のみ） |
+| 近いハンド同士の強弱逆転・レイズ%のばらつき | §3 サンプリング分散 | 反復増、DCFR α/β、VR-MCCFR ベースライン | 小〜中 |
+| まれなハンドが未学習（旧 KK 問題） | §3 訪問頻度の偏り | 解析対象の伏せ札を一様サンプル（**対応済み**） | — |
+| セルがブロック状に同一 | §5 バケット抽象化 | rootExact（**対応済み**、手番ストリートのみ） | — |
+| 将来ストリートの粗さによる境界 EV の歪み | §5 | 将来ストリートの抽象化細分は pathology と反復コストに注意 | 大 |
+
+`razzCfr.ts` は現在 vanilla external-sampling MCCFR（均一平均・割引なし・ベースラインなし）。
+Kuhn poker の解析解クロスチェックテストがあるため、上記のどの変更もテストで裏取りできる。
+
+## 7. 改善ロードマップ（費用対効果順）
+
+1. **平均戦略の二次加重（DCFR の γ=2）**: `strategySum += strategy` を
+   `strategySum += w(t)·strategy` に変更。残留ノイズの主因を除去。
+2. **regret-matching+（負リグレットのクリップ、DCFR β=0 相当）**: 方向転換を高速化。
+   Kuhn テストで均衡収束を再確認する。
+3. **表示 thresholding**: グリッド表示時に頻度 <3〜5% を 0 に丸めて再正規化（トグル可能に）。
+4. **収束診断の可視化**: 別シード2本の乖離やセルの訪問量から「収束インジケータ」を表示。
+5. **VR-MCCFR ベースライン**: まれな局面の分散を根本から下げる（中規模の変更）。
+6. **exploitability の直接計測**: 小型ゲーム（Kuhn / 縮小 Razz）で最良応答を厳密計算し、
+   反復数と ε の関係を回帰テスト化する。
+
+## 参考文献
+
+- Zinkevich, Johanson, Bowling, Piccione. *Regret Minimization in Games with Incomplete
+  Information*. NIPS 2007.（CFR の原典。平均戦略の ε-Nash 収束と regret bound）
+- Lanctot, Waugh, Zinkevich, Bowling. *Monte Carlo Sampling for Regret Minimization in
+  Extensive Games*. NIPS 2009. https://mlanctot.info/files/papers/nips09mccfr.pdf
+  （MCCFR / external sampling の定義と高確率収束バウンド）
+- Tammelin. *Solving Large Imperfect Information Games Using CFR+*. arXiv:1407.5042 (2014) /
+  Bowling, Burch, Johanson, Tammelin. *Heads-up Limit Hold'em Poker is Solved*. Science (2015) /
+  Tammelin et al. *Solving Heads-up Limit Texas Hold'em*. IJCAI 2015.
+  https://poker.cs.ualberta.ca/publications/2015-ijcai-cfrplus.pdf
+- Brown, Sandholm. *Solving Imperfect-Information Games via Discounted Regret Minimization*.
+  AAAI 2019. https://arxiv.org/abs/1809.04040（Linear CFR / DCFR、α=1.5, β=0, γ=2）
+- Schmid, Burch, Lanctot, Moravcik, Kadlec, Bowling. *Variance Reduction in Monte Carlo CFR
+  (VR-MCCFR) Using Baselines*. AAAI 2019. https://arxiv.org/abs/1809.03057
+- Ganzfried, Sandholm, Waugh. *Strategy Purification and Thresholding: Effective
+  Non-Equilibrium Approaches for Playing Large Games*. AAMAS 2012.
+  https://www.cs.cmu.edu/~sandholm/StrategyPurification_AAMAS2012_camera_ready_2.pdf
+- Waugh, Schnizlein, Bowling, Szafron. *Abstraction Pathologies in Extensive Games*.
+  AAMAS 2009. https://poker.cs.ualberta.ca/publications/AAMAS09-abstraction.pdf
+- Johanson, Bard, Burch, Bowling. *Finding Optimal Abstract Strategies in Extensive-Form
+  Games*（CFR-BR）. AAAI 2012. https://poker.cs.ualberta.ca/publications/AAAI12-cfrbr.pdf

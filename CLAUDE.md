@@ -35,6 +35,9 @@ ofc-solver から独立させたリポジトリ。
 
 ## ドメイン設計メモ（src/domain/）
 
+- **理論的背景と精度改善ロードマップは `docs/solver-theory.md`**（CFR/MCCFR/CFR+/DCFR/
+  thresholding の文献整理と、観測された収束ノイズの原因分析）。ソルバー精度に関わる変更の前に読む。
+
 - `cards.ts` / `combinatorics.ts`: ofc-solver 由来の共有ユーティリティ。カードは `{rank, suit}`
   （A=14。Razz 側で A=1 に変換）。モンテカルロは決定論的 PRNG（`mulberry32`）を注入して
   テストの再現性を確保する。ジョーカーの型は残っているが **Razz では非対応**（`razzRank` が拒否）。
