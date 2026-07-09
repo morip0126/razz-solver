@@ -13,6 +13,7 @@ import {
 // GitHub Pages 以外の静的ホスティングでもパス解決不要にするため）
 import SolverWorker from './worker/solverWorker?worker&inline'
 import type { SolveGridRequest, SolverResponse } from './worker/solverWorker'
+import DrawView from './DrawView'
 import { type Lang, type MessageKey, t } from './i18n'
 
 // グリッドの行/列順（Razz ランク。K が最弱 → 左上、A が最強 → 右下）
@@ -343,8 +344,7 @@ function cellBackground(actions: readonly RazzActionLabel[], freqs: readonly num
   return `linear-gradient(to right, ${stops.join(', ')})`
 }
 
-export default function App() {
-  const [lang, setLang] = useState<Lang>('ja')
+function RazzView({ lang }: { lang: Lang }) {
   const [players, setPlayers] = useState(6)
   const [upRanks, setUpRanks] = useState<string[]>(['J', 'T', '7', '6', '8', 'K'])
   // 既定ステークス: 参照ソルバーとの校正でブリングインのポットオッズ約 4.6:1 の構造に合わせた
@@ -439,21 +439,7 @@ export default function App() {
   }
 
   return (
-    <main className="app">
-      <header className="app-header">
-        <div>
-          <h1>{t(lang, 'title')}</h1>
-          <p className="subtitle">{t(lang, 'subtitle')}</p>
-        </div>
-        <button
-          type="button"
-          className="lang-toggle"
-          onClick={() => setLang((l) => (l === 'ja' ? 'en' : 'ja'))}
-        >
-          {lang === 'ja' ? 'EN' : 'JA'}
-        </button>
-      </header>
-
+    <>
       <section className="panel controls">
         <div className="row">
           <label className="field">
@@ -683,6 +669,45 @@ export default function App() {
           </p>
         </section>
       )}
+    </>
+  )
+}
+
+export default function App() {
+  const [lang, setLang] = useState<Lang>('ja')
+  const [game, setGame] = useState<'razz' | 'draw'>('razz')
+  return (
+    <main className="app">
+      <header className="app-header">
+        <div>
+          <h1>{t(lang, game === 'razz' ? 'title' : 'titleDraw')}</h1>
+          <p className="subtitle">{t(lang, game === 'razz' ? 'subtitle' : 'subtitleDraw')}</p>
+        </div>
+        <button
+          type="button"
+          className="lang-toggle"
+          onClick={() => setLang((l) => (l === 'ja' ? 'en' : 'ja'))}
+        >
+          {lang === 'ja' ? 'EN' : 'JA'}
+        </button>
+      </header>
+      <nav className="tabs">
+        <button
+          type="button"
+          className={game === 'razz' ? 'tab active' : 'tab'}
+          onClick={() => setGame('razz')}
+        >
+          {t(lang, 'tabRazz')}
+        </button>
+        <button
+          type="button"
+          className={game === 'draw' ? 'tab active' : 'tab'}
+          onClick={() => setGame('draw')}
+        >
+          {t(lang, 'tabDraw')}
+        </button>
+      </nav>
+      {game === 'razz' ? <RazzView lang={lang} /> : <DrawView lang={lang} />}
     </main>
   )
 }

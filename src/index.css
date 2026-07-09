@@ -94,6 +94,67 @@ button {
   margin-top: 12px;
 }
 
+/* ---- ゲームタブ ---- */
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.tab {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  border-radius: 10px 10px 0 0;
+  padding: 8px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.tab.active {
+  color: var(--text);
+  border-color: var(--accent);
+  border-bottom-color: transparent;
+  background: var(--panel2);
+}
+
+/* ---- 2-7 レンジ表 ---- */
+
+.range-table {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 10px;
+}
+
+.range-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1.4fr) 48px 2fr;
+  gap: 8px;
+  align-items: center;
+}
+
+.range-label {
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.range-weight {
+  font-size: 11px;
+  color: var(--muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.range-bar {
+  height: 18px;
+  border-radius: 4px;
+}
+
 .hint {
   color: var(--muted);
   font-size: 13px;

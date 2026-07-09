@@ -1,8 +1,22 @@
 # 開発メモ（Razz Solver）
 
-Razz（セブンカードスタッド・ローボール、A-5 ロー）のスポットソルバー。Vite + React + TypeScript。
-ofc-solver から独立させたリポジトリ。
+Razz（セブンカードスタッド・ローボール、A-5 ロー）と NL 2-7 シングルドロー（HU）の
+ソルバー。Vite + React + TypeScript。ofc-solver から独立させたリポジトリ。
 重い計算を UI に載せるときは Web Worker で実行する（ofc-solver と同じ流儀）。
+UI はタブ切替（`App.tsx` = シェル + RazzView、`DrawView.tsx` = 2-7）。
+
+## NL 2-7 シングルドロー（src/domain/lowball.ts + drawGame.ts + DrawView.tsx）
+
+- `lowball.ts`: 2-7 評価（A 常にハイ、ストレート/フラッシュは逆目、A2345 は非ストレート）。
+  razz.ts と同じく参照実装 `lowballValue5` と高速版 `lowballKey5` の二本立て + クロスチェック。
+- `drawGame.ts`: HU 限定（BTN 0.5bb / BB 1bb、スタック可変）。ベットはポットサイズ +
+  オールインのみのサイズ抽象化（オープンは自然に 3bb）。ドローは 0〜2 枚、捨て札は
+  「ペアを崩し高い札から」の決定的ルール（ストレート/フラッシュの引き目は無視）。
+  バケット: プリ =（パット強さ×1枚ドロー質×2枚ドロー質）、ポスト = 完成役ティア13種。
+  HU なので `solveDrawTree` で**ゲーム全体（プリ→ドロー→ポスト）を一括ソルブ**でき、
+  `queryDrawTree` が任意ノードをモンテカルロ到達加重で照会する（razz と違い遅延ツリー不要）。
+- `drawWorker.ts`: 解を Worker 内に保持し solve / query の 2 メッセージで応答。
+  50k 反復 ≈ 13 秒、ノード照会は 1〜2 秒。
 
 ## UI（src/App.tsx + src/worker/solverWorker.ts）
 
