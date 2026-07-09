@@ -46,6 +46,8 @@ ofc-solver から独立させたリポジトリ。
   **`razz.test.ts` の全ランク多重集合クロスチェックを必ず維持する**。ベスト5枚は `razzBestKey`（5〜7枚）。
 - `razzRange.ts`: 相手伏せ札のレンジ重み付けモデル（参加者は低札寄り・自ボードとのペア回避）。
   `lowBias=0` で一様に退化（`UNIFORM_RAZZ_RANGE`）。ホットパス用に `rankWeightTable` で重みを事前計算。
+  **既定値（lowBias 0.15）は参照ソルバーの 3rd street グリッドに校正済み**
+  （docs/solver-theory.md §7.2）。強くしすぎると守備側が過度にタイトになる。
 - `razzEquity.ts`: `estimateRazzEquity` = ショーダウン EQ のモンテカルロ。7ロー/8ロー到達確率も返す。
 - `razzCfr.ts`: 汎用 MCCFR（external sampling）コア。ゲーム定義は `CfrGame` インターフェースで注入。
   **Kuhn poker の解析解（ゲーム値 -1/18、K は常にコール等）とのクロスチェックテスト

@@ -7,6 +7,7 @@ import {
   type RazzHistoryReplay,
   parseCard,
   replayRazzHistory,
+  thresholdStrategy,
 } from './domain'
 // ?worker&inline: Worker コードを本体バンドルへ埋め込む（単一ファイル配布・
 // GitHub Pages 以外の静的ホスティングでもパス解決不要にするため）
@@ -44,12 +45,19 @@ const GROUP_COLOR = {
 } as const
 
 const PRESETS = [
-  { key: 'presetFast', iterations: 3000, rootExact: false },
-  { key: 'presetStandard', iterations: 10000, rootExact: false },
-  { key: 'presetFine', iterations: 30000, rootExact: false },
-  // 手番ストリートをバケットではなく正確な91ランクペアで解く（収束に多くの反復が要る）
-  { key: 'presetExact', iterations: 40000, rootExact: true },
-] as const satisfies readonly { key: MessageKey; iterations: number; rootExact: boolean }[]
+  { key: 'presetFast', iterations: 3000, rootExact: false, workers: 1 },
+  { key: 'presetStandard', iterations: 10000, rootExact: false, workers: 1 },
+  { key: 'presetFine', iterations: 30000, rootExact: false, workers: 1 },
+  // 手番ストリートをバケットではなく正確な91ランクペアで解く。境界ハンドの
+  // 収束ノイズを抑えるため、独立した Worker 3 本を並列実行して平均する
+  // （壁時計はほぼ 1 本分、分散は 1/√3。実効 240k 反復相当）。
+  { key: 'presetExact', iterations: 80000, rootExact: true, workers: 3 },
+] as const satisfies readonly {
+  key: MessageKey
+  iterations: number
+  rootExact: boolean
+  workers: number
+}[]
 
 // 表示 thresholding: この頻度未満のアクションは収束ノイズとみなして 0 に丸める
 // （Ganzfried & Sandholm 2012。docs/solver-theory.md §4.3）
@@ -113,37 +121,102 @@ type SolverState =
   | { status: 'done'; result: RazzGridResult }
   | { status: 'error'; message: string }
 
-/** レンジグリッド解析を Web Worker で実行するフック。再計算時は前の Worker を破棄する。 */
+/**
+ * 独立ソルブの結果を平均し（アンサンブル）、平均後に thresholding をかけて
+ * 全体頻度を再集計する。セル順・アクション順は全結果で同一。
+ */
+function mergeGridResults(results: RazzGridResult[], threshold: number): RazzGridResult {
+  const base = results[0]
+  const cells = base.cells.map((cell, ci) => ({
+    ...cell,
+    frequencies: thresholdStrategy(
+      cell.frequencies.map(
+        (_, ai) => results.reduce((x, r) => x + r.cells[ci].frequencies[ai], 0) / results.length,
+      ),
+      threshold,
+    ),
+  }))
+  const totals = base.totals.map(() => 0)
+  let combos = 0
+  for (const c of cells) {
+    if (c.combos === 0) continue
+    combos += c.combos
+    c.frequencies.forEach((f, ai) => {
+      totals[ai] += f * c.combos
+    })
+  }
+  return {
+    ...base,
+    cells,
+    totals: combos > 0 ? totals.map((x) => x / combos) : totals,
+  }
+}
+
+/**
+ * レンジグリッド解析を Web Worker で実行するフック。workers > 1 なら独立した
+ * ソルブを並列実行して平均する（マルチコア活用。分散が 1/√N になる）。
+ * 再計算時は前の Worker 群を破棄する。
+ */
 function useGridSolver() {
-  const workerRef = useRef<Worker | null>(null)
+  const workersRef = useRef<Worker[]>([])
   const idRef = useRef(0)
   const [state, setState] = useState<SolverState>({ status: 'idle' })
 
-  const solve = useCallback((spot: RazzGridSpot, iterations: number, rootExact: boolean) => {
-    workerRef.current?.terminate()
-    let worker: Worker
-    try {
-      worker = new SolverWorker()
-    } catch (err) {
-      // Worker が使えない環境（CSP 等）ではエラー表示に落とす
-      setState({ status: 'error', message: err instanceof Error ? err.message : String(err) })
-      return
-    }
-    workerRef.current = worker
-    const id = ++idRef.current
-    setState({ status: 'solving', progress: 0 })
-    worker.onmessage = (e: MessageEvent<SolverResponse>) => {
-      const msg = e.data
-      if (msg.id !== id) return
-      if (msg.type === 'progress') setState({ status: 'solving', progress: msg.done / msg.total })
-      else if (msg.type === 'result') setState({ status: 'done', result: msg.result })
-      else setState({ status: 'error', message: msg.message })
-    }
-    const req: SolveGridRequest = { id, spot, iterations, rootExact, threshold: DISPLAY_THRESHOLD }
-    worker.postMessage(req)
-  }, [])
+  const solve = useCallback(
+    (spot: RazzGridSpot, iterations: number, rootExact: boolean, workerCount: number) => {
+      for (const w of workersRef.current) w.terminate()
+      workersRef.current = []
+      const id = ++idRef.current
+      const progresses = new Array<number>(workerCount).fill(0)
+      const results = new Array<RazzGridResult | null>(workerCount).fill(null)
+      setState({ status: 'solving', progress: 0 })
+      for (let k = 0; k < workerCount; k++) {
+        let worker: Worker
+        try {
+          worker = new SolverWorker()
+        } catch (err) {
+          // Worker が使えない環境（CSP 等）ではエラー表示に落とす
+          setState({ status: 'error', message: err instanceof Error ? err.message : String(err) })
+          return
+        }
+        workersRef.current.push(worker)
+        const slot = k
+        worker.onmessage = (e: MessageEvent<SolverResponse>) => {
+          const msg = e.data
+          if (msg.id !== id) return
+          if (msg.type === 'progress') {
+            progresses[slot] = msg.done / msg.total
+            setState({
+              status: 'solving',
+              progress: progresses.reduce((x, y) => x + y, 0) / workerCount,
+            })
+          } else if (msg.type === 'result') {
+            results[slot] = msg.result
+            if (results.every((r) => r !== null)) {
+              setState({
+                status: 'done',
+                result: mergeGridResults(results as RazzGridResult[], DISPLAY_THRESHOLD),
+              })
+            }
+          } else {
+            for (const w of workersRef.current) w.terminate()
+            setState({ status: 'error', message: msg.message })
+          }
+        }
+        // thresholding はアンサンブル平均の後に UI 側でかける（Worker は生の頻度を返す）
+        const req: SolveGridRequest = { id, spot, iterations, rootExact, threshold: 0 }
+        worker.postMessage(req)
+      }
+    },
+    [],
+  )
 
-  useEffect(() => () => workerRef.current?.terminate(), [])
+  useEffect(
+    () => () => {
+      for (const w of workersRef.current) w.terminate()
+    },
+    [],
+  )
   return { state, solve }
 }
 
@@ -167,7 +240,8 @@ export default function App() {
   const [lang, setLang] = useState<Lang>('ja')
   const [players, setPlayers] = useState(6)
   const [upRanks, setUpRanks] = useState<string[]>(['J', 'T', '7', '6', '8', 'K'])
-  const [stakes, setStakes] = useState<StakesInput>({ ante: '1', bringIn: '2', smallBet: '4', bigBet: '8' })
+  // 既定ステークス: 参照ソルバーとの校正でブリングインのポットオッズ約 4.6:1 の構造に合わせた
+  const [stakes, setStakes] = useState<StakesInput>({ ante: '1', bringIn: '1.75', smallBet: '4', bigBet: '8' })
   const [presetIdx, setPresetIdx] = useState(1)
   const [history, setHistory] = useState('')
   // 表示中の結果に対応する入力（結果ヘッダ表示と、頻度ボタンの同期判定に使う）
@@ -204,6 +278,7 @@ export default function App() {
       { street: 3, seats: parsed.seats, stakes: stakesNum, history: hist },
       preset.iterations,
       preset.rootExact,
+      preset.workers,
     )
   }
 

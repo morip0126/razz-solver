@@ -12,8 +12,13 @@ export interface RazzRangeModel {
   pairPenalty: number
 }
 
-/** 既定のレンジモデル（参加者は低札寄り・自ボードとのペアを避ける想定）。 */
-export const DEFAULT_RAZZ_RANGE: RazzRangeModel = { lowBias: 1.5, pairPenalty: 0.5 }
+/**
+ * 既定のレンジモデル（参加者は低札寄り・自ボードとのペアを避ける想定）。
+ * 強さは参照ソルバーの 3rd street レンジグリッドに対して校正した
+ * （lowBias 1.5 ではコンプリートレンジが強すぎ、ブリングインの守備が過度に
+ * タイトになる。スチール気味の参加レンジは一様にかなり近い）。
+ */
+export const DEFAULT_RAZZ_RANGE: RazzRangeModel = { lowBias: 0.15, pairPenalty: 0.85 }
 
 /** 一様ランダム（不偏）。検証・比較用。 */
 export const UNIFORM_RAZZ_RANGE: RazzRangeModel = { lowBias: 0, pairPenalty: 1 }

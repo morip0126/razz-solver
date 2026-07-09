@@ -32,6 +32,7 @@ import {
 } from './razzRange'
 import {
   type CfrGame,
+  type CfrSolution,
   averageStrategy,
   estimateActionValues,
   runMccfr,
@@ -122,6 +123,15 @@ export interface RazzSolveOptions {
   /** MCCFR のチューニング（McCfrOptions へそのまま渡す。既定は razzCfr.ts 参照）。 */
   regretMatchingPlus?: boolean
   averagingExponent?: number
+  /**
+   * 内生的レンジ条件付け（グリッド解析・3rd street のみ）: ストリート先頭から全席の戦略を
+   * この反復数で事前ソルブし、履歴で観測されたアクションの尤度（ベイズ条件付け）で
+   * 相手の伏せ札レンジを重み付けする。「コンプリートした相手はどんなハンドか」を
+   * 固定モデルでなくソルバー自身が導出する。実験的（2 段の MCCFR の分散が重なり
+   * 結果が不安定になりやすい。docs/solver-theory.md §7 参照）。既定 0 = 無効
+   * （校正済みの lowBias レンジモデルを使用）。
+   */
+  rangeIterations?: number
 }
 
 /**
@@ -209,7 +219,26 @@ interface SpotCtx {
   root: BetState
   /** ルートストリートの情報集合をバケットではなく正確な伏せ札ランクで区別する。 */
   rootExact: boolean
+  /**
+   * 適応ホライズン: horizon を超えていても、ストリート終了時にアクティブ 2 人以下なら
+   * リバーまで継続する（マルチウェイはフォールドで 2 人に減った時点からフルツリー）。
+   */
+  adaptiveHorizon: boolean
   range: RazzRangeModel
+  /** 全席の伏せ札を一様にサンプルする（レンジ推定の事前ソルブ用）。 */
+  uniformDeals: boolean
+  /**
+   * rootExact の適用をこの履歴文字列（canonical hist）のノードに限定する。
+   * null = ルートストリートの全ノード。レンジ推定の事前ソルブでは観測履歴の
+   * プレフィックスだけ正確にすれば十分で、情報集合の爆発を防ぐ。
+   */
+  exactHistSet: ReadonlySet<string> | null
+  /**
+   * 席ごとのランクペア重み（インデックス lo*14+hi、lo<=hi）。非 null の席は
+   * lowBias モデルの代わりにこの重み × 残り枚数でペアをサンプルする
+   * （履歴アクションの尤度によるレンジ条件付け）。
+   */
+  seatPairWeights: (Float64Array | null)[]
   /** 学習用プール（Hero の伏せ札もサンプル対象に含める）。 */
   trainPool: Card[]
   /** 評価用プール（Hero の伏せ札を除く）。 */
@@ -277,13 +306,16 @@ function activeCount(s: BetState): number {
 // ---- 抽象化（バケット / ボードティア） ------------------------------------------
 
 /**
- * ハンドバケット: メイドローの強さティア × 8以下の異なるランク数。
+ * ハンドバケット: メイドローの強さティア × 8以下の異なるランク数 × 9の有無。
  * ティア: 0=5ロー以下 1=6ロー 2=7ロー 3=8ロー 4=9/10ロー 5=それ以上のメイド
  *         6=未完成（ペアなし） 7=未完成（ペアあり）
+ * 9 の有無を分けるのは、9 ローへのドロー（K/T ボード相手には十分強い）と
+ * 10 ロー以下へのドローを将来ストリートで区別するため。
  */
 export function razzHandBucket(cards: readonly Card[]): number {
   const distinct = [...new Set(cards.map(razzRank))].sort((a, b) => a - b)
   const lowCount = Math.min(7, distinct.filter((r) => r <= 8).length)
+  const has9 = distinct.includes(9) ? 1 : 0
   let tier: number
   if (distinct.length >= 5) {
     const high = distinct[4]
@@ -291,7 +323,7 @@ export function razzHandBucket(cards: readonly Card[]): number {
   } else {
     tier = cards.length > distinct.length ? 7 : 6
   }
-  return tier * 8 + lowCount
+  return (tier * 8 + lowCount) * 2 + has9
 }
 
 /** ボードティア（相手のアップカードの粗い分類。5=ペアボード）。 */
@@ -428,7 +460,10 @@ function applyAction(
   // ストリートのベッティング終了
   s.pot += s.contrib.reduce((x, y) => x + y, 0)
   s.contrib.fill(0)
-  if (s.street >= ctx.horizon) {
+  const continues =
+    s.street < 7 &&
+    (s.street < ctx.horizon || (ctx.adaptiveHorizon && activeCount(s) <= 2))
+  if (!continues) {
     s.done = true
     s.actor = -1
     return s
@@ -479,14 +514,64 @@ function infosetKeyOf(state: BetState, deal: RazzDeal, ctx: SpotCtx): string {
     if (i === p) continue
     tiers += state.folded[i] ? 'F' : String(deal.boardTiers[i][idx])
   }
-  const own =
-    ctx.rootExact && state.street === ctx.root.street
-      ? exactDownKey(deal.hands[p], state.street)
-      : String(deal.buckets[p][idx])
-  return `${state.street}|${state.hist}|${own}|${tiers}`
+  const exact =
+    ctx.rootExact &&
+    state.street === ctx.root.street &&
+    (!ctx.exactHistSet || ctx.exactHistSet.has(state.hist))
+  const own = exact ? exactDownKey(deal.hands[p], state.street) : String(deal.buckets[p][idx])
+  if (state.street === ctx.root.street) {
+    return `${state.street}|${state.hist}|${own}|${tiers}`
+  }
+  // ルート以降のストリートは履歴全文でなく（ポット, ストリート内履歴）で圧縮する
+  // （imperfect recall 抽象化）。ポットが過去のベット額の十分統計量になり、
+  // マルチウェイ開始のツリーでも情報集合の爆発を防ぐ。
+  const local = state.hist.slice(state.hist.lastIndexOf('/') + 1)
+  return `${state.street}|${state.pot}|${local}|${own}|${tiers}`
 }
 
 // ---- 配札サンプリング -----------------------------------------------------------
+
+/** pool から指定ランクのカードを一様に 1 枚引く（破壊的）。 */
+function drawRank(pool: Card[], rank: number, rng: () => number): Card {
+  let count = 0
+  for (const c of pool) if (razzRank(c) === rank) count++
+  let k = Math.floor(rng() * count)
+  for (let i = 0; i < pool.length; i++) {
+    if (razzRank(pool[i]) === rank && k-- === 0) {
+      const card = pool[i]
+      pool[i] = pool[pool.length - 1]
+      pool.pop()
+      return card
+    }
+  }
+  throw new Error('razz: drawRank found no card')
+}
+
+/**
+ * ランクペア重み（インデックス lo*14+hi）× 残り枚数からペアを 1 つ選び、
+ * そのランクの実カードを pool から引く（破壊的）。全重みゼロなら一様にフォールバック。
+ */
+function samplePairWeighted(pool: Card[], w: Float64Array, rng: () => number): Card[] {
+  const counts = new Array<number>(14).fill(0)
+  for (const c of pool) counts[razzRank(c)]++
+  let total = 0
+  for (let lo = 1; lo <= 13; lo++) {
+    for (let hi = lo; hi <= 13; hi++) {
+      const combos = lo === hi ? (counts[lo] * (counts[lo] - 1)) / 2 : counts[lo] * counts[hi]
+      total += w[lo * 14 + hi] * combos
+    }
+  }
+  if (total <= 0) return [drawUniform(pool, rng), drawUniform(pool, rng)]
+  let threshold = rng() * total
+  for (let lo = 1; lo <= 13; lo++) {
+    for (let hi = lo; hi <= 13; hi++) {
+      const combos = lo === hi ? (counts[lo] * (counts[lo] - 1)) / 2 : counts[lo] * counts[hi]
+      threshold -= w[lo * 14 + hi] * combos
+      if (threshold <= 0) return [drawRank(pool, lo, rng), drawRank(pool, hi, rng)]
+    }
+  }
+  return [drawUniform(pool, rng), drawUniform(pool, rng)] // 浮動小数の取りこぼし
+}
 
 function sampleRazzDeal(
   ctx: SpotCtx,
@@ -498,23 +583,27 @@ function sampleRazzDeal(
   const pool = pool0.slice()
   const n = ctx.n
 
-  // 伏せ札。相手はレンジ重み付き、解析対象（Hero / 手番）自身は一様にサンプルする。
-  // 自札までレンジで偏らせると高札ハンドの情報集合がほぼ訪問されず学習されない
-  // （例: K アップの KK は A2 の約 1/400）。フォールドによるレンジの絞り込みは
-  // 戦略そのものが表現する。7th の 3 枚目は配られたばかりなので常に一様。
+  // 伏せ札のサンプリング。
+  // - 解析対象（Hero / 手番）自身は一様: 自札までレンジで偏らせると高札ハンドの
+  //   情報集合がほぼ訪問されず学習されない（例: K アップの KK は A2 の約 1/400）。
+  //   フォールドによるレンジの絞り込みは戦略そのものが表現する。
+  // - seatPairWeights のある席は履歴尤度で条件付けされたペア分布から。
+  // - uniformDeals（レンジ推定の事前ソルブ）は全席一様。
+  // - それ以外は lowBias レンジモデル。7th の 3 枚目は配られたばかりなので常に一様。
   const downs: Card[][] = new Array(n)
   for (let i = 0; i < n; i++) {
-    if (i === ctx.heroIndex) {
-      if (fixedHeroDown) {
-        downs[i] = [...fixedHeroDown]
-        continue
-      }
-      const hidden = [drawUniform(pool, rng), drawUniform(pool, rng)]
-      if (street === 7) hidden.push(drawUniform(pool, rng))
-      downs[i] = hidden
+    if (i === ctx.heroIndex && fixedHeroDown) {
+      downs[i] = [...fixedHeroDown]
       continue
     }
-    const hidden = sampleHiddenCards(pool, 2, ctx.seatWeights[i], rng)
+    let hidden: Card[]
+    if (ctx.uniformDeals || i === ctx.heroIndex) {
+      hidden = [drawUniform(pool, rng), drawUniform(pool, rng)]
+    } else if (ctx.seatPairWeights[i]) {
+      hidden = samplePairWeighted(pool, ctx.seatPairWeights[i]!, rng)
+    } else {
+      hidden = sampleHiddenCards(pool, 2, ctx.seatWeights[i], rng)
+    }
     if (street === 7) hidden.push(drawUniform(pool, rng))
     downs[i] = hidden
   }
@@ -556,6 +645,12 @@ interface BuildInput {
   history: readonly string[]
   /** null = グリッド解析（履歴後の手番席を Hero に採用し、実ハンドは固定しない）。 */
   hero: { index: number; down: Card[] } | null
+  /** 全席の伏せ札を一様にサンプルする（レンジ推定の事前ソルブ用）。 */
+  uniformDeals?: boolean
+  /** ストリート終了時にアクティブ 2 人以下ならリバーまで継続する。 */
+  adaptiveHorizon?: boolean
+  /** rootExact をこの履歴ノードに限定する（SpotCtx.exactHistSet 参照）。 */
+  exactHistPrefixes?: ReadonlySet<string>
 }
 
 function buildCtx(input: BuildInput, opts: RazzSolveOptions): SpotCtx {
@@ -611,7 +706,11 @@ function buildCtx(input: BuildInput, opts: RazzSolveOptions): SpotCtx {
     horizon: 7, // リプレイでは未使用（現在ストリート内のみ）。後で確定する。
     root: state,
     rootExact: opts.rootExact ?? false,
+    adaptiveHorizon: input.adaptiveHorizon ?? false,
     range,
+    uniformDeals: input.uniformDeals ?? false,
+    exactHistSet: input.exactHistPrefixes ?? null,
+    seatPairWeights: new Array<Float64Array | null>(n).fill(null),
     trainPool: [],
     evalPool: [],
     seatWeights: seats.map((s) => rankWeightTable(new Set(s.up.map(razzRank)), range)),
@@ -746,8 +845,53 @@ function cardOfRazzRank(r: number): Card {
   return { rank: (r === 1 ? 14 : r) as Card['rank'], suit: 'c' }
 }
 
-/** 閾値未満の頻度を 0 に丸めて再正規化する（thresholding）。全滅する場合は元を返す。 */
-function thresholdStrategy(freqs: number[], threshold: number): number[] {
+/**
+ * ストリート先頭から履歴をリプレイし、各席について「観測された自分のアクション列を
+ * 取る尤度」をランクペアごとに返す（ベイズ的なレンジ条件付け）。
+ * sol はストリート先頭を根とするソルブの解で、キーの粒度（rootExact / exactHistSet）は
+ * ctx と一致していること。アクションを取っていない席は null。
+ */
+function seatLikelihoodsFromHistory(
+  sol: CfrSolution,
+  ctx: SpotCtx,
+  history: readonly string[],
+): (Float64Array | null)[] {
+  const L: (Float64Array | null)[] = new Array(ctx.n).fill(null)
+  let cur = ctx.root
+  for (const raw of history) {
+    const legal = legalActionsOf(cur, ctx)
+    const action = coerceRazzAction(raw, legal)
+    if (!action) throw new Error(`razz: illegal action "${raw}" in history`)
+    const aIdx = legal.indexOf(action)
+    const s = cur.actor
+    let tiers = ''
+    for (let i = 0; i < ctx.n; i++) {
+      if (i === s) continue
+      tiers += cur.folded[i] ? 'F' : String(razzBoardTier(ctx.seats[i].up))
+    }
+    if (!L[s]) L[s] = new Float64Array(196).fill(1)
+    const ls = L[s]!
+    const exact =
+      ctx.rootExact && (!ctx.exactHistSet || ctx.exactHistSet.has(cur.hist))
+    for (let lo = 1; lo <= 13; lo++) {
+      for (let hi = lo; hi <= 13; hi++) {
+        const own = exact
+          ? `e${lo}.${hi}`
+          : String(razzHandBucket([cardOfRazzRank(lo), cardOfRazzRank(hi), ...ctx.seats[s].up]))
+        const key = `${cur.street}|${cur.hist}|${own}|${tiers}`
+        ls[lo * 14 + hi] *= averageStrategy(sol, key, legal.length)[aIdx]
+      }
+    }
+    cur = applyAction(cur, ctx, null, action)
+  }
+  return L
+}
+
+/**
+ * 閾値未満の頻度を 0 に丸めて再正規化する（thresholding）。全滅する場合は元を返す。
+ * UI のアンサンブル平均後の後処理にも使う。
+ */
+export function thresholdStrategy(freqs: number[], threshold: number): number[] {
   const kept = freqs.map((f) => (f < threshold ? 0 : f))
   const total = kept.reduce((x, y) => x + y, 0)
   if (total <= 0) return freqs
@@ -764,8 +908,14 @@ function historyChars(history: RazzGridSpot['history']): readonly string[] {
 /**
  * レンジグリッド解析: 履歴の後に手番となるプレイヤーについて、伏せ札 2 枚の
  * 全ランクペア（91 通り）の平均戦略を返す。実ハンドは固定せず、公開情報
- * （全員のアップカード + 履歴）だけで解く。バケット抽象化のため、同じバケットに
- * 落ちるランクペアは同一の戦略になる。7th street（伏せ札 3 枚）は非対応。
+ * （全員のアップカード + 履歴）だけで解く。7th street（伏せ札 3 枚）は非対応。
+ *
+ * 2 段階ソルブ（3rd street で履歴があるとき、rangeIterations > 0）:
+ * 1. ストリート先頭を根に全席一様の伏せ札で事前ソルブし、履歴で観測された各席の
+ *    アクション列の尤度をランクペアごとに求める（内生的なレンジ条件付け。
+ *    「コンプリートした相手のレンジ」を固定モデルでなくソルバー自身が導出する）。
+ * 2. 履歴後を根に、相手の伏せ札を尤度×残り枚数の分布からサンプルして本ソルブ。
+ *
  * 重い計算なので UI からは Web Worker 経由で呼ぶこと。
  */
 export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = {}): RazzGridResult {
@@ -775,6 +925,7 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
   const rng = opts.rng ?? mulberry32((Math.random() * 0xffffffff) >>> 0)
   const iterations = opts.iterations ?? 30000
   const threshold = opts.threshold ?? 0
+  const history = historyChars(spot.history)
   const ctx = buildCtx(
     {
       street: spot.street,
@@ -783,16 +934,59 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
       stakes: spot.stakes,
       pot: spot.pot,
       bringInIndex: spot.bringInIndex,
-      history: historyChars(spot.history),
+      history,
       hero: null,
+      adaptiveHorizon: true,
     },
     opts,
   )
 
+  // 段階 1: 内生的レンジ条件付け（3rd street で履歴があるときのみ）。
+  // 「最終的にアクティブな席の最初のアクション」より前（脱落した席のフォールド等）は
+  // 条件付けに関与しないため先に適用し、そこを根に事前ソルブする。典型例
+  // （フォールドが続いてコンプリート）では実質ヘッズアップの木になり、
+  // マルチウェイ CFR の振動（収束保証なし）を避けられる。
+  const rep = spot.street === 3 && history.length > 0 ? replayRazzHistory(spot) : null
+  const condStart = rep ? rep.steps.findIndex((s) => !rep.folded[s.seatIndex]) : -1
+  const rangeIterations = rep && condStart >= 0 ? (opts.rangeIterations ?? 0) : 0
+  const totalIters = iterations + rangeIterations
+  const progress = opts.onProgress
+  if (rangeIterations > 0) {
+    const ctx1 = buildCtx(
+      {
+        street: spot.street,
+        seats: spot.seats,
+        dead: spot.dead ?? [],
+        stakes: spot.stakes,
+        pot: spot.pot,
+        bringInIndex: spot.bringInIndex,
+        history: history.slice(0, condStart),
+        hero: null,
+        uniformDeals: true,
+        adaptiveHorizon: true,
+      },
+      // レンジ推定はバケット粒度で行う（ペア単位だと訪問数が足りずノイズになる）
+      { ...opts, rootExact: false },
+    )
+    const sol1 = runMccfr(makeGame(ctx1, null), {
+      iterations: rangeIterations,
+      rng,
+      onProgress: progress ? (done) => progress(done, totalIters) : undefined,
+      regretMatchingPlus: opts.regretMatchingPlus,
+      averagingExponent: opts.averagingExponent,
+    })
+    const likelihoods = seatLikelihoodsFromHistory(sol1, ctx1, history.slice(condStart))
+    for (let i = 0; i < ctx.n; i++) {
+      if (i === ctx.heroIndex || ctx.root.folded[i]) continue
+      ctx.seatPairWeights[i] = likelihoods[i]
+    }
+  }
+
+  // 段階 2: 履歴後を根にした本ソルブ
   const sol = runMccfr(makeGame(ctx, null), {
     iterations,
     rng,
-    onProgress: opts.onProgress,
+    onProgress: progress ? (done) => progress(rangeIterations + done, totalIters) : undefined,
     regretMatchingPlus: opts.regretMatchingPlus,
     averagingExponent: opts.averagingExponent,
   })
@@ -923,7 +1117,11 @@ export function replayRazzHistory(spot: RazzGridSpot): RazzHistoryReplay {
     horizon: spot.street,
     root: state,
     rootExact: false,
+    adaptiveHorizon: false,
     range: DEFAULT_RAZZ_RANGE,
+    uniformDeals: false,
+    exactHistSet: null,
+    seatPairWeights: new Array<Float64Array | null>(n).fill(null),
     trainPool: [],
     evalPool: [],
     seatWeights: [],

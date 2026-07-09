@@ -109,6 +109,16 @@ describe('solveRazzRangeGrid', () => {
     expect(freq(r, cell(r, 13, 13), 'fold')).toBeGreaterThan(0.6)
   }, 60000)
 
+  it('校正: ブリングインの守備境界は 9 と T の間（9x コール / Jx フォールド）', () => {
+    // 参照ソルバーとの校正スポット（ante 1 / bringIn 1.75、既定レンジ lowBias 0.15）
+    const r = solveRazzRangeGrid(
+      { ...GRID_SPOT, stakes: { ante: 1, bringIn: 1.75, smallBet: 4, bigBet: 8 } },
+      { iterations: 12000, rng: mulberry32(9), rootExact: true },
+    )
+    expect(freq(r, cell(r, 2, 9), 'fold')).toBeLessThan(0.5) // (2,9) は守備側
+    expect(freq(r, cell(r, 2, 11), 'fold')).toBeGreaterThan(0.5) // (2,J) はフォールド側
+  }, 120000)
+
   it('threshold: 閾値未満の頻度は 0 に丸めて再正規化される', () => {
     const r = solveRazzRangeGrid(GRID_SPOT, {
       iterations: 500,
