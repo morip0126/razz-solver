@@ -197,6 +197,16 @@ describe('replayRazzHistory', () => {
   })
 })
 
+describe('noLimp', () => {
+  it('3rd street のリンプを禁止するとフォールド/コンプリートの2択になる', () => {
+    const r = replayRazzHistory({ ...GRID_SPOT, history: '', noLimp: true })
+    expect(r.legalActions).toEqual(['fold', 'complete'])
+    // コンプリートに直面したら通常どおりコール可
+    const r2 = replayRazzHistory({ ...GRID_SPOT, history: 'ffffr', noLimp: true })
+    expect(r2.legalActions).toEqual(['fold', 'call', 'raise'])
+  })
+})
+
 describe('coerceRazzAction', () => {
   it('1文字表記を局面の合法アクションへ解決する', () => {
     expect(coerceRazzAction('r', ['fold', 'call', 'complete'])).toBe('complete')

@@ -115,15 +115,9 @@ function seatsFromRanks(rankChars: string[], lang: Lang): { seats?: { up: Card[]
   return { seats }
 }
 
-type SolverState =
-  | { status: 'idle' }
-  | { status: 'solving'; progress: number }
-  | { status: 'done'; result: RazzGridResult }
-  | { status: 'error'; message: string }
-
 /**
  * 独立ソルブの結果を平均し（アンサンブル）、平均後に thresholding をかけて
- * 全体頻度を再集計する。セル順・アクション順は全結果で同一。
+ * 到達レンジ×コンボ加重の集計を再計算する。セル順・アクション順は全結果で同一。
  */
 function mergeGridResults(results: RazzGridResult[], threshold: number): RazzGridResult {
   const base = results[0]
@@ -137,87 +131,200 @@ function mergeGridResults(results: RazzGridResult[], threshold: number): RazzGri
     ),
   }))
   const totals = base.totals.map(() => 0)
-  let combos = 0
+  let totalCombos = 0
   for (const c of cells) {
-    if (c.combos === 0) continue
-    combos += c.combos
+    const w = c.combos * c.reach
+    if (w <= 0) continue
+    totalCombos += w
     c.frequencies.forEach((f, ai) => {
-      totals[ai] += f * c.combos
+      totals[ai] += f * w
     })
   }
   return {
     ...base,
     cells,
-    totals: combos > 0 ? totals.map((x) => x / combos) : totals,
+    comboTotals: totals.slice(),
+    totalCombos,
+    totals: totalCombos > 0 ? totals.map((x) => x / totalCombos) : totals,
   }
 }
 
-/**
- * レンジグリッド解析を Web Worker で実行するフック。workers > 1 なら独立した
- * ソルブを並列実行して平均する（マルチコア活用。分散が 1/√N になる）。
- * 再計算時は前の Worker 群を破棄する。
- */
-function useGridSolver() {
-  const workersRef = useRef<Worker[]>([])
-  const idRef = useRef(0)
-  const [state, setState] = useState<SolverState>({ status: 'idle' })
+type SolverState =
+  | { status: 'idle' }
+  | { status: 'solving'; progress: number; nodeIndex: number; nodeCount: number }
+  | { status: 'ready' }
+  | { status: 'error'; message: string }
 
-  const solve = useCallback(
-    (spot: RazzGridSpot, iterations: number, rootExact: boolean, workerCount: number) => {
-      for (const w of workersRef.current) w.terminate()
-      workersRef.current = []
-      const id = ++idRef.current
-      const progresses = new Array<number>(workerCount).fill(0)
-      const results = new Array<RazzGridResult | null>(workerCount).fill(null)
-      setState({ status: 'solving', progress: 0 })
-      for (let k = 0; k < workerCount; k++) {
-        let worker: Worker
-        try {
-          worker = new SolverWorker()
-        } catch (err) {
-          // Worker が使えない環境（CSP 等）ではエラー表示に落とす
-          setState({ status: 'error', message: err instanceof Error ? err.message : String(err) })
-          return
-        }
-        workersRef.current.push(worker)
-        const slot = k
-        worker.onmessage = (e: MessageEvent<SolverResponse>) => {
-          const msg = e.data
-          if (msg.id !== id) return
-          if (msg.type === 'progress') {
-            progresses[slot] = msg.done / msg.total
-            setState({
-              status: 'solving',
-              progress: progresses.reduce((x, y) => x + y, 0) / workerCount,
-            })
-          } else if (msg.type === 'result') {
-            results[slot] = msg.result
-            if (results.every((r) => r !== null)) {
-              setState({
-                status: 'done',
-                result: mergeGridResults(results as RazzGridResult[], DISPLAY_THRESHOLD),
-              })
-            }
-          } else {
-            for (const w of workersRef.current) w.terminate()
-            setState({ status: 'error', message: msg.message })
+interface TreeView {
+  history: string
+  result: RazzGridResult
+}
+
+/**
+ * 遅延ツリーソルバー。ナビゲートしたノードを（初回のみ）Worker アンサンブルで
+ * ソルブしてキャッシュし、訪問済みノードは即時表示する。各ノードのソルブは
+ * 経路上の先行ノードの解いた頻度で各席の入口レンジを条件付けする
+ * （＝レンジがアクションを経て内生的に絞られていく）。
+ */
+function useTreeSolver() {
+  const cacheRef = useRef(new Map<string, RazzGridResult>())
+  const cacheKeyRef = useRef('')
+  const workersRef = useRef<Worker[]>([])
+  const runIdRef = useRef(0)
+  const [state, setState] = useState<SolverState>({ status: 'idle' })
+  const [view, setView] = useState<TreeView | null>(null)
+
+  const cancel = useCallback(() => {
+    runIdRef.current++
+    for (const w of workersRef.current) w.terminate()
+    workersRef.current = []
+  }, [])
+  useEffect(() => cancel, [cancel])
+
+  /** 1 ノードをアンサンブルでソルブする。キャンセル時は永遠に解決しない。 */
+  const solveNode = useCallback(
+    (
+      req: Omit<SolveGridRequest, 'id' | 'threshold'>,
+      workerCount: number,
+      runId: number,
+      onProgress: (p: number) => void,
+    ) =>
+      new Promise<RazzGridResult>((resolve, reject) => {
+        const progresses = new Array<number>(workerCount).fill(0)
+        const results = new Array<RazzGridResult | null>(workerCount).fill(null)
+        for (let k = 0; k < workerCount; k++) {
+          let worker: Worker
+          try {
+            worker = new SolverWorker()
+          } catch (err) {
+            reject(err instanceof Error ? err : new Error(String(err)))
+            return
           }
+          workersRef.current.push(worker)
+          const slot = k
+          worker.onmessage = (e: MessageEvent<SolverResponse>) => {
+            if (runIdRef.current !== runId) return
+            const msg = e.data
+            if (msg.type === 'progress') {
+              progresses[slot] = msg.done / msg.total
+              onProgress(progresses.reduce((x, y) => x + y, 0) / workerCount)
+            } else if (msg.type === 'result') {
+              results[slot] = msg.result
+              if (results.every((r) => r !== null)) {
+                resolve(mergeGridResults(results as RazzGridResult[], DISPLAY_THRESHOLD))
+              }
+            } else {
+              reject(new Error(msg.message))
+            }
+          }
+          worker.postMessage({ id: runId, threshold: 0, ...req } satisfies SolveGridRequest)
         }
-        // thresholding はアンサンブル平均の後に UI 側でかける（Worker は生の頻度を返す）
-        const req: SolveGridRequest = { id, spot, iterations, rootExact, threshold: 0 }
-        worker.postMessage(req)
+      }),
+    [],
+  )
+
+  /**
+   * 対象履歴のノードと、その経路上でアクティブな席が行動した先行ノードを
+   * 順にソルブしてキャッシュし、対象ノードを表示する。
+   */
+  const navigate = useCallback(
+    async (
+      spotKey: string,
+      makeSpot: (history: string) => RazzGridSpot,
+      replayOf: (history: string) => RazzHistoryReplay,
+      targetHistory: string,
+      preset: (typeof PRESETS)[number],
+    ) => {
+      if (cacheKeyRef.current !== spotKey) {
+        cacheRef.current.clear()
+        cacheKeyRef.current = spotKey
+        setView(null)
+      }
+      const cache = cacheRef.current
+      const rep = replayOf(targetHistory)
+
+      // 経路上の先行ノードの解から、席ごとの到達重み（自アクション頻度の積）を計算
+      const reachAt = (history: string, replay: RazzHistoryReplay) => {
+        const L: (number[] | null)[] = replay.folded.map(() => null)
+        replay.steps.forEach((s, i) => {
+          if (replay.folded[s.seatIndex]) return
+          const pre = cache.get(history.slice(0, i))
+          if (!pre) return
+          const aIdx = pre.actions.indexOf(s.action)
+          if (aIdx < 0) return
+          const arr = (L[s.seatIndex] ??= new Array<number>(196).fill(1))
+          for (const c of pre.cells) {
+            arr[c.ranks[0] * 14 + c.ranks[1]] *= c.frequencies[aIdx]
+          }
+        })
+        return L
+      }
+
+      // ソルブが必要なノード列（先行 → 対象の順）
+      const nodes: string[] = []
+      rep.steps.forEach((s, i) => {
+        if (!rep.folded[s.seatIndex]) nodes.push(targetHistory.slice(0, i))
+      })
+      if (!rep.done) nodes.push(targetHistory)
+      const todo = nodes.filter((h) => !cache.has(h))
+
+      cancel()
+      const runId = runIdRef.current
+      try {
+        for (const [i, h] of todo.entries()) {
+          setState({ status: 'solving', progress: 0, nodeIndex: i + 1, nodeCount: todo.length })
+          const hRep = replayOf(h)
+          const L = reachAt(h, hRep)
+          const actorReach = hRep.actorIndex >= 0 ? (L[hRep.actorIndex] ?? undefined) : undefined
+          const seatPairWeights = L.map((w, si) => (si === hRep.actorIndex ? null : w))
+          const result = await solveNode(
+            {
+              spot: makeSpot(h),
+              iterations: preset.iterations,
+              rootExact: preset.rootExact,
+              seatPairWeights,
+              actorReach,
+            },
+            preset.workers,
+            runId,
+            (p) =>
+              setState({
+                status: 'solving',
+                progress: p,
+                nodeIndex: i + 1,
+                nodeCount: todo.length,
+              }),
+          )
+          if (runIdRef.current !== runId) return
+          cache.set(h, result)
+        }
+        setState({ status: 'ready' })
+        const final = cache.get(targetHistory)
+        setView(final ? { history: targetHistory, result: final } : null)
+      } catch (err) {
+        if (runIdRef.current !== runId) return
+        setState({ status: 'error', message: err instanceof Error ? err.message : String(err) })
       }
     },
+    [cancel, solveNode],
+  )
+
+  /** キャッシュ済みノードの即時表示（未ソルブなら false）。 */
+  const showCached = useCallback((spotKey: string, history: string): boolean => {
+    if (cacheKeyRef.current !== spotKey) return false
+    const result = cacheRef.current.get(history)
+    if (!result) return false
+    setView({ history, result })
+    return true
+  }, [])
+
+  const peek = useCallback(
+    (spotKey: string, history: string): RazzGridResult | undefined =>
+      cacheKeyRef.current === spotKey ? cacheRef.current.get(history) : undefined,
     [],
   )
 
-  useEffect(
-    () => () => {
-      for (const w of workersRef.current) w.terminate()
-    },
-    [],
-  )
-  return { state, solve }
+  return { state, view, setView, navigate, showCached, peek, cancel }
 }
 
 /** セル背景: アクション頻度を 縦縞（call → raise → fold の順）のグラデーションで表す。 */
@@ -244,19 +351,29 @@ export default function App() {
   const [stakes, setStakes] = useState<StakesInput>({ ante: '1', bringIn: '1.75', smallBet: '4', bigBet: '8' })
   const [presetIdx, setPresetIdx] = useState(1)
   const [history, setHistory] = useState('')
-  // 表示中の結果に対応する入力（結果ヘッダ表示と、頻度ボタンの同期判定に使う）
-  const [solvedCtx, setSolvedCtx] = useState<{ upRanks: string[]; history: string } | null>(null)
-  const { state, solve } = useGridSolver()
+  const { state, view, navigate, showCached, peek } = useTreeSolver()
 
   const ranks = upRanks.slice(0, players)
   const parsed = seatsFromRanks(ranks, lang)
   const stakesNum = parseStakes(stakes)
+  const spotKey = `${ranks.join('')}|${stakes.ante}|${stakes.bringIn}|${stakes.smallBet}|${stakes.bigBet}|${presetIdx}`
+
+  // noLimp: リンプを許すと「強いハンドでリンプするトラップ均衡」に落ち、
+  // コンプリートレンジの条件付けが実戦の慣行と乖離するため、UI では常に無効化する
+  const makeSpot = (hist: string): RazzGridSpot => ({
+    street: 3,
+    seats: parsed.seats!,
+    stakes: stakesNum!,
+    history: hist,
+    noLimp: true,
+  })
+  const replayOf = (hist: string) => replayRazzHistory(makeSpot(hist))
 
   // 履歴のリプレイ（手番・合法アクション・ポット）。入力が不完全な間は null。
   let replay: RazzHistoryReplay | null = null
   if (parsed.seats && stakesNum) {
     try {
-      replay = replayRazzHistory({ street: 3, seats: parsed.seats, stakes: stakesNum, history })
+      replay = replayOf(history)
     } catch {
       replay = null
     }
@@ -272,53 +389,54 @@ export default function App() {
 
   const runSolve = (hist: string) => {
     if (!parsed.seats || !stakesNum) return
-    const preset = PRESETS[presetIdx]
-    setSolvedCtx({ upRanks: ranks, history: hist })
-    solve(
-      { street: 3, seats: parsed.seats, stakes: stakesNum, history: hist },
-      preset.iterations,
-      preset.rootExact,
-      preset.workers,
-    )
+    void navigate(spotKey, makeSpot, replayOf, hist, PRESETS[presetIdx])
   }
 
-  /** アクションを 1 手進める。fromResult=true（頻度ボタン）は続きも自動計算する。 */
-  const pushAction = (action: RazzActionLabel, fromResult: boolean) => {
+  /** アクションを 1 手進める。キャッシュ済みなら即時、未ソルブならソルブする。 */
+  const pushAction = (action: RazzActionLabel) => {
     if (!parsed.seats || !stakesNum) return
     const next = history + ACTION_TO_CHAR[action]
     setHistory(next)
-    if (!fromResult) return
     try {
-      const nr = replayRazzHistory({ street: 3, seats: parsed.seats, stakes: stakesNum, history: next })
-      if (!nr.done) runSolve(next)
+      const nr = replayOf(next)
+      if (nr.done) return // ビルダーに終了表示（グリッドは前のまま）
     } catch {
-      // 入力が壊れている場合は何もしない（ビルダー側にエラー表示が出る）
+      return
     }
+    if (!showCached(spotKey, next)) runSolve(next)
   }
 
-  const undo = () => setHistory((h) => h.slice(0, -1))
-  const reset = () => setHistory('')
-
-  const onPrevious = () => {
-    if (history.length === 0) return
+  const undo = () => {
     const next = history.slice(0, -1)
     setHistory(next)
-    runSolve(next)
+    showCached(spotKey, next)
+  }
+  const reset = () => {
+    setHistory('')
+    showCached(spotKey, '')
   }
 
-  const result = state.status === 'done' ? state.result : null
-  // 表示中の結果と現在の入力が一致しているか（不一致なら頻度ボタンを無効化）
-  const inSync =
-    solvedCtx != null &&
-    solvedCtx.history === history &&
-    solvedCtx.upRanks.join() === ranks.join()
-  const cellMap = new Map<string, { combos: number; frequencies: number[] }>()
+  const result = view?.result ?? null
+  // 表示中の結果と現在の入力が一致しているか
+  const inSync = view != null && view.history === history
+  const cellMap = new Map<string, { combos: number; reach: number; frequencies: number[] }>()
   if (result) {
     for (const c of result.cells) cellMap.set(`${c.ranks[0]}-${c.ranks[1]}`, c)
   }
 
   const inputError = parsed.error ?? (stakesNum ? null : t(lang, 'errStakes'))
   const foldWin = replay?.done && replay.folded.filter((f) => !f).length === 1
+  const solving = state.status === 'solving'
+
+  // タイムラインチップ用: 各ステップのアクション頻度（キャッシュ済みノードから）
+  const stepPct = (i: number): string | null => {
+    if (!replay) return null
+    const pre = peek(spotKey, history.slice(0, i))
+    if (!pre) return null
+    const aIdx = pre.actions.indexOf(replay.steps[i].action)
+    if (aIdx < 0) return null
+    return `${(pre.totals[aIdx] * 100).toFixed(0)}%`
+  }
 
   return (
     <main className="app">
@@ -418,6 +536,7 @@ export default function App() {
                   <b>{t(lang, 'position', { n: s.seatIndex + 1 })}</b>
                   {' '}{ranks[s.seatIndex]}{' '}
                   {t(lang, ACTION_LABEL_KEY[s.action])}
+                  {stepPct(i) && <em className="step-pct">{stepPct(i)}</em>}
                 </span>
               ))}
             </div>
@@ -436,16 +555,21 @@ export default function App() {
                 </span>
               </p>
               <div className="builder-buttons">
-                {replay.legalActions.map((a) => (
-                  <button
-                    key={a}
-                    type="button"
-                    className={`action-button act-${actionGroup(a)}`}
-                    onClick={() => pushAction(a, false)}
-                  >
-                    {t(lang, ACTION_LABEL_KEY[a])}
-                  </button>
-                ))}
+                {replay.legalActions.map((a) => {
+                  const ai = inSync && result ? result.actions.indexOf(a) : -1
+                  return (
+                    <button
+                      key={a}
+                      type="button"
+                      className={`action-button act-${actionGroup(a)}`}
+                      disabled={solving}
+                      onClick={() => pushAction(a)}
+                    >
+                      {t(lang, ACTION_LABEL_KEY[a])}
+                      {ai >= 0 && result && ` ${(result.totals[ai] * 100).toFixed(0)}%`}
+                    </button>
+                  )
+                })}
               </div>
             </>
           )}
@@ -458,10 +582,10 @@ export default function App() {
 
           {history.length > 0 && (
             <div className="builder-nav">
-              <button type="button" className="nav-button" onClick={undo}>
+              <button type="button" className="nav-button" disabled={solving} onClick={undo}>
                 {t(lang, 'undo')}
               </button>
-              <button type="button" className="nav-button" onClick={reset}>
+              <button type="button" className="nav-button" disabled={solving} onClick={reset}>
                 {t(lang, 'reset')}
               </button>
             </div>
@@ -471,14 +595,18 @@ export default function App() {
         <button
           type="button"
           className="go-button"
-          disabled={state.status === 'solving' || !replay || replay.done}
+          disabled={solving || !replay || replay.done || inSync}
           onClick={() => runSolve(history)}
         >
-          {state.status === 'solving'
-            ? t(lang, 'solving', { pct: Math.round(state.progress * 100) })
+          {solving
+            ? t(lang, 'nodeProgress', {
+                i: state.nodeIndex,
+                k: state.nodeCount,
+                pct: Math.round(state.progress * 100),
+              })
             : t(lang, 'go')}
         </button>
-        {state.status === 'solving' && (
+        {solving && (
           <div className="progress-track">
             <div className="progress-bar" style={{ width: `${state.progress * 100}%` }} />
           </div>
@@ -487,17 +615,19 @@ export default function App() {
         {state.status === 'error' && <p className="error">{state.message}</p>}
       </section>
 
-      {result && (
+      {result && view && (
         <section className="panel result">
           <h2 className="actor-title">
             {t(lang, 'actorTitle', {
               n: result.actorIndex + 1,
-              card: solvedCtx?.upRanks[result.actorIndex] ?? '',
+              card: ranks[result.actorIndex] ?? '',
             })}
           </h2>
           <p className="hint">
             {t(lang, result.horizon === 'river' ? 'horizonRiver' : 'horizonStreet')}
           </p>
+
+          {!inSync && <p className="hint stale-note">{t(lang, 'staleResult')}</p>}
 
           <div className="grid">
             {RANK_ORDER.map((hi, i) =>
@@ -512,7 +642,7 @@ export default function App() {
                   ? `${label}: ${t(lang, 'combos', { n: 0 })}`
                   : `${label}: ${result.actions
                       .map((a, k) => `${t(lang, ACTION_LABEL_KEY[a])} ${(cell.frequencies[k] * 100).toFixed(0)}%`)
-                      .join(' / ')} (${t(lang, 'combos', { n: cell.combos })})`
+                      .join(' / ')} (${t(lang, 'combos', { n: (cell.combos * cell.reach).toFixed(1) })})`
                 return (
                   <div
                     key={key}
@@ -522,6 +652,7 @@ export default function App() {
                       gridRow: i + 1,
                       gridColumn: j + 1,
                       background: dead ? undefined : cellBackground(result.actions, cell.frequencies),
+                      opacity: dead ? undefined : 0.25 + 0.75 * cell.reach,
                     }}
                   >
                     {label}
@@ -537,33 +668,18 @@ export default function App() {
             <span><i className="swatch" style={{ background: 'var(--act-raise)' }} />{t(lang, 'legendRaise')}</span>
           </div>
 
-          {!inSync && <p className="hint stale-note">{t(lang, 'staleResult')}</p>}
-
-          <div className="action-bar">
-            <button
-              type="button"
-              className="nav-button"
-              disabled={state.status === 'solving' || history.length === 0}
-              onClick={onPrevious}
-            >
-              {t(lang, 'previous')}
-            </button>
+          <div className="totals-bar">
             {result.actions.map((a, i) => (
-              <button
-                key={a}
-                type="button"
-                className={`action-button act-${actionGroup(a)}`}
-                disabled={state.status === 'solving' || !inSync}
-                onClick={() => pushAction(a, true)}
-              >
-                {t(lang, ACTION_LABEL_KEY[a])} {(result.totals[i] * 100).toFixed(0)}%
-              </button>
+              <span key={a} className={`total-chip act-${actionGroup(a)}`}>
+                <b>{t(lang, ACTION_LABEL_KEY[a])} {(result.totals[i] * 100).toFixed(1)}%</b>
+                <small>{t(lang, 'combos', { n: result.comboTotals[i].toFixed(1) })}</small>
+              </span>
             ))}
           </div>
 
           <p className="hint">
             {t(lang, result.rootExact ? 'noteExact' : 'noteAbstraction')}{' '}
-            {t(lang, 'noteThreshold')}
+            {t(lang, 'noteThreshold')} {t(lang, 'noteLazyTree')}
           </p>
         </section>
       )}

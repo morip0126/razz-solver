@@ -232,6 +232,13 @@ button {
   background: color-mix(in srgb, var(--act-raise) 22%, var(--panel));
 }
 
+.step-pct {
+  font-style: normal;
+  font-weight: 700;
+  margin-left: 4px;
+  color: var(--muted);
+}
+
 .next-line {
   font-size: 14px;
   font-weight: 600;
@@ -377,6 +384,40 @@ button {
   border-radius: 3px;
   display: inline-block;
 }
+
+/* ---- 集計チップ（到達レンジ加重の全体頻度） ---- */
+
+.totals-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+  margin-bottom: 10px;
+}
+
+.total-chip {
+  flex: 1;
+  min-width: 100px;
+  border-radius: 10px;
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  color: rgba(0, 0, 0, 0.8);
+}
+
+.total-chip b {
+  font-size: 14px;
+}
+
+.total-chip small {
+  font-size: 11px;
+  opacity: 0.75;
+}
+
+.total-chip.act-fold { background: var(--act-fold); }
+.total-chip.act-call { background: var(--act-call); }
+.total-chip.act-raise { background: var(--act-raise); }
 
 /* ---- アクションバー ---- */
 

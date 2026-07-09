@@ -76,6 +76,8 @@ export interface RazzSpot {
   actionsSoFar?: RazzActionLabel[]
   /** 3rd street のブリングイン席。省略時は最高位のアップカードから自動判定。 */
   bringInIndex?: number
+  /** 3rd street のリンプ（ブリングインへのコール）を許可しない。既定 false。 */
+  noLimp?: boolean
 }
 
 export interface RazzActionAdvice {
@@ -132,6 +134,17 @@ export interface RazzSolveOptions {
    * （校正済みの lowBias レンジモデルを使用）。
    */
   rangeIterations?: number
+  /**
+   * 席ごとの伏せ札ランクペア重み（インデックス lo*14+hi、null = 既定のレンジモデル）。
+   * 経路上の先行ノードの解いた頻度で各席の入口レンジを条件付けするために使う
+   * （遅延ツリー: 各プレイヤーのレンジがアクションを経て内生的に絞られていく）。
+   */
+  seatPairWeights?: readonly (readonly number[] | null)[]
+  /**
+   * 手番プレイヤー自身の到達重み（196 要素、lo*14+hi）。学習には使わず、
+   * セルの reach とレンジ加重集計（totals / comboTotals）にのみ反映する。
+   */
+  actorReach?: readonly number[]
 }
 
 /**
@@ -154,6 +167,12 @@ export interface RazzGridSpot {
   history?: string | readonly string[]
   /** 3rd street のブリングイン席。省略時は最高位のアップカードから自動判定。 */
   bringInIndex?: number
+  /**
+   * アクション抽象化: 3rd street でブリングインに対するリンプ（コール）を許可しない
+   * （フォールドかコンプリートのみ）。リンプを許すと本モデルの均衡は「強いハンドで
+   * リンプして罠を張る」偏極構造になり、参照ソルバーや実戦の慣行と乖離する。既定 false。
+   */
+  noLimp?: boolean
 }
 
 export interface RazzGridCell {
@@ -163,6 +182,8 @@ export interface RazzGridCell {
   combos: number
   /** actions と同順の頻度（平均戦略）。 */
   frequencies: number[]
+  /** 手番プレイヤーの到達確率（actorReach 指定時のみ 1 未満になる）。 */
+  reach: number
 }
 
 export interface RazzGridResult {
@@ -171,8 +192,12 @@ export interface RazzGridResult {
   actions: RazzActionLabel[]
   /** 全 91 ランクペア（A..K の組み合わせ + ペア）。 */
   cells: RazzGridCell[]
-  /** コンボ数で加重した全体頻度（actions と同順）。 */
+  /** 到達レンジ×コンボ数で加重した全体頻度（actions と同順）。 */
   totals: number[]
+  /** アクション別の到達加重コンボ数（小数）。 */
+  comboTotals: number[]
+  /** 到達加重の総コンボ数。 */
+  totalCombos: number
   horizon: 'river' | 'street'
   iterations: number
   /** true = 手番ストリートを正確な伏せ札ランクで解いた（セルごとに独立の戦略）。 */
@@ -224,6 +249,8 @@ interface SpotCtx {
    * リバーまで継続する（マルチウェイはフォールドで 2 人に減った時点からフルツリー）。
    */
   adaptiveHorizon: boolean
+  /** 3rd street のリンプ（ブリングインへのコール）を許可しない（RazzGridSpot.noLimp）。 */
+  noLimp: boolean
   range: RazzRangeModel
   /** 全席の伏せ札を一様にサンプルする（レンジ推定の事前ソルブ用）。 */
   uniformDeals: boolean
@@ -375,7 +402,10 @@ function upsAtStreet(deal: RazzDeal, street: number): Card[][] {
 
 function legalActionsOf(state: BetState, ctx: SpotCtx): RazzActionLabel[] {
   const toCall = state.betLevel - state.contrib[state.actor]
-  const actions: RazzActionLabel[] = toCall > 0 ? ['fold', 'call'] : ['check']
+  // noLimp: 3rd street でブリングイン額に対するコール（リンプ）を許可しない
+  const isLimp = state.street === 3 && state.betLevel === ctx.stakes.bringIn
+  const actions: RazzActionLabel[] =
+    toCall > 0 ? (ctx.noLimp && isLimp ? ['fold'] : ['fold', 'call']) : ['check']
   if (state.raises < ctx.stakes.raiseCap) {
     actions.push(
       state.betLevel === 0
@@ -651,6 +681,8 @@ interface BuildInput {
   adaptiveHorizon?: boolean
   /** rootExact をこの履歴ノードに限定する（SpotCtx.exactHistSet 参照）。 */
   exactHistPrefixes?: ReadonlySet<string>
+  /** 3rd street のリンプを許可しない（RazzGridSpot.noLimp）。 */
+  noLimp?: boolean
 }
 
 function buildCtx(input: BuildInput, opts: RazzSolveOptions): SpotCtx {
@@ -707,6 +739,7 @@ function buildCtx(input: BuildInput, opts: RazzSolveOptions): SpotCtx {
     root: state,
     rootExact: opts.rootExact ?? false,
     adaptiveHorizon: input.adaptiveHorizon ?? false,
+    noLimp: input.noLimp ?? false,
     range,
     uniformDeals: input.uniformDeals ?? false,
     exactHistSet: input.exactHistPrefixes ?? null,
@@ -782,6 +815,7 @@ export function solveRazzSpot(spot: RazzSpot, opts: RazzSolveOptions = {}): Razz
       bringInIndex: spot.bringInIndex,
       history: spot.actionsSoFar ?? [],
       hero: { index: spot.heroIndex, down: spot.heroDown },
+      noLimp: spot.noLimp ?? false,
     },
     opts,
   )
@@ -937,6 +971,7 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
       history,
       hero: null,
       adaptiveHorizon: true,
+      noLimp: spot.noLimp ?? false,
     },
     opts,
   )
@@ -964,6 +999,7 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
         hero: null,
         uniformDeals: true,
         adaptiveHorizon: true,
+        noLimp: spot.noLimp ?? false,
       },
       // レンジ推定はバケット粒度で行う（ペア単位だと訪問数が足りずノイズになる）
       { ...opts, rootExact: false },
@@ -979,6 +1015,16 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
     for (let i = 0; i < ctx.n; i++) {
       if (i === ctx.heroIndex || ctx.root.folded[i]) continue
       ctx.seatPairWeights[i] = likelihoods[i]
+    }
+  }
+
+  // 呼び出し側から与えられた入口レンジ条件付け（遅延ツリー: 経路上の先行ノードの
+  // 解いた頻度）。stage 1 の結果より優先する。
+  if (opts.seatPairWeights) {
+    for (let i = 0; i < ctx.n; i++) {
+      const w = opts.seatPairWeights[i]
+      if (!w || i === ctx.heroIndex || ctx.root.folded[i]) continue
+      ctx.seatPairWeights[i] = Float64Array.from(w)
     }
   }
 
@@ -1019,13 +1065,16 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
       const key = `${ctx.root.street}|${ctx.root.hist}|${own}|${tiers}`
       let frequencies = averageStrategy(sol, key, actions.length)
       if (threshold > 0) frequencies = thresholdStrategy(frequencies, threshold)
-      cells.push({ ranks: [r1, r2], combos, frequencies })
-      if (combos > 0) {
-        totalCombos += combos
-        for (let i = 0; i < actions.length; i++) totals[i] += combos * frequencies[i]
+      const reach = opts.actorReach ? opts.actorReach[r1 * 14 + r2] : 1
+      cells.push({ ranks: [r1, r2], combos, frequencies, reach })
+      const w = combos * reach
+      if (w > 0) {
+        totalCombos += w
+        for (let i = 0; i < actions.length; i++) totals[i] += w * frequencies[i]
       }
     }
   }
+  const comboTotals = totals.slice()
   if (totalCombos > 0) {
     for (let i = 0; i < actions.length; i++) totals[i] /= totalCombos
   }
@@ -1035,6 +1084,8 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
     actions,
     cells,
     totals,
+    comboTotals,
+    totalCombos,
     horizon: activeCount(ctx.root) === 2 ? 'river' : 'street',
     iterations,
     rootExact: ctx.rootExact,
@@ -1118,6 +1169,7 @@ export function replayRazzHistory(spot: RazzGridSpot): RazzHistoryReplay {
     root: state,
     rootExact: false,
     adaptiveHorizon: false,
+    noLimp: spot.noLimp ?? false,
     range: DEFAULT_RAZZ_RANGE,
     uniformDeals: false,
     exactHistSet: null,
@@ -1156,5 +1208,232 @@ export function replayRazzHistory(spot: RazzGridSpot): RazzHistoryReplay {
     bringInIndex,
     folded: [...cur.folded],
     invalidAt,
+  }
+}
+
+// ---- ツリーモード（GTO Wizard 風の一括ソルブ → ノード閲覧） ------------------------
+
+/** ツリーモードのスポット（履歴なし。履歴は queryRazzTree で指定する）。 */
+export type RazzTreeSpot = Omit<RazzGridSpot, 'history'>
+
+/**
+ * ストリート先頭から一括ソルブした解のハンドル。Worker 内に保持して
+ * queryRazzTree で任意のノードを即時に照会する。構造は内部実装。
+ */
+export interface RazzTreeSolution {
+  sol: CfrSolution
+  ctx: SpotCtx
+  iterations: number
+  rootExact: boolean
+}
+
+export interface RazzTreeCell {
+  /** 伏せ札2枚の Razz ランク（1=A .. 13=K）、昇順。 */
+  ranks: [number, number]
+  /** 残りデッキから作れる生のコンボ数。 */
+  combos: number
+  /** 到達確率（この席が履歴どおりのアクションを取った頻度の積、0..1）。 */
+  reach: number
+  /** actions と同順の頻度（平均戦略、生値）。 */
+  frequencies: number[]
+}
+
+export interface RazzTreeStep {
+  seatIndex: number
+  action: RazzActionLabel
+  actions: RazzActionLabel[]
+  /** その席の判断ノードでの到達レンジ×コンボ加重のアクション頻度。 */
+  freqs: number[]
+}
+
+export interface RazzTreeNode {
+  /** true = この履歴でハンド / ストリートが終了（グリッドなし）。 */
+  done: boolean
+  actorIndex: number
+  actions: RazzActionLabel[]
+  cells: RazzTreeCell[]
+  /** 到達レンジ×コンボ加重の全体頻度（actions と同順）。 */
+  totals: number[]
+  /** アクション別の到達加重コンボ数（GTO Wizard の小数コンボ表示に対応）。 */
+  comboTotals: number[]
+  /** 到達加重の総コンボ数。 */
+  totalCombos: number
+  /** 履歴の各アクションの席・集計頻度（タイムライン表示用）。 */
+  steps: RazzTreeStep[]
+}
+
+/** ノード（現在ストリート）における席 s の全ランクペア戦略（インデックス lo*14+hi）。 */
+function pairStrategiesAt(
+  sol: CfrSolution,
+  ctx: SpotCtx,
+  state: BetState,
+  s: number,
+  nActions: number,
+): number[][] {
+  let tiers = ''
+  for (let i = 0; i < ctx.n; i++) {
+    if (i === s) continue
+    tiers += state.folded[i] ? 'F' : String(razzBoardTier(ctx.seats[i].up))
+  }
+  const exact =
+    ctx.rootExact &&
+    state.street === ctx.root.street &&
+    (!ctx.exactHistSet || ctx.exactHistSet.has(state.hist))
+  const out: number[][] = new Array(196)
+  for (let lo = 1; lo <= 13; lo++) {
+    for (let hi = lo; hi <= 13; hi++) {
+      const own = exact
+        ? `e${lo}.${hi}`
+        : String(razzHandBucket([cardOfRazzRank(lo), cardOfRazzRank(hi), ...ctx.seats[s].up]))
+      out[lo * 14 + hi] = averageStrategy(sol, `${state.street}|${state.hist}|${own}|${tiers}`, nActions)
+    }
+  }
+  return out
+}
+
+/**
+ * ストリート先頭からツリー全体を一括ソルブする（GTO Wizard 風の閲覧用）。
+ * 全席の伏せ札を一様に配り、各席のレンジ（どのハンドがどのアクションを取るか）は
+ * 自己対戦の反復を通じて完全に内生的に形成される。ストリート終了時に
+ * アクティブ 2 人以下ならリバーまで継続（それ以外はチェックダウン近似）。
+ * 非常に重い計算なので UI からは Web Worker 経由で呼び、解を保持して
+ * queryRazzTree で任意のノードを照会すること。7th street は非対応。
+ */
+export function solveRazzTree(spot: RazzTreeSpot, opts: RazzSolveOptions = {}): RazzTreeSolution {
+  if (spot.street === 7) {
+    throw new Error('razz: tree mode is not supported on 7th street (3 downcards)')
+  }
+  const rng = opts.rng ?? mulberry32((Math.random() * 0xffffffff) >>> 0)
+  const iterations = opts.iterations ?? 30000
+  const ctx = buildCtx(
+    {
+      street: spot.street,
+      seats: spot.seats,
+      dead: spot.dead ?? [],
+      stakes: spot.stakes,
+      pot: spot.pot,
+      bringInIndex: spot.bringInIndex,
+      history: [],
+      hero: null,
+      uniformDeals: true,
+      adaptiveHorizon: true,
+      noLimp: spot.noLimp ?? false,
+    },
+    opts,
+  )
+  const sol = runMccfr(makeGame(ctx, null), {
+    iterations,
+    rng,
+    onProgress: opts.onProgress,
+    regretMatchingPlus: opts.regretMatchingPlus,
+    averagingExponent: opts.averagingExponent,
+  })
+  return { sol, ctx, iterations, rootExact: ctx.rootExact }
+}
+
+/**
+ * 一括ソルブ済みのツリーから、指定履歴のノードを照会する（再計算なし・即時）。
+ * 手番プレイヤーの 91 ランクペアの戦略と到達レンジ、履歴各ステップの集計頻度、
+ * 到達レンジ×コンボ加重の全体頻度を返す。
+ */
+export function queryRazzTree(
+  tree: RazzTreeSolution,
+  history: RazzGridSpot['history'],
+): RazzTreeNode {
+  const { sol, ctx } = tree
+  const chars = historyChars(history)
+
+  // ランク別の残り枚数 → ペアの生コンボ数
+  const avail = new Array<number>(14).fill(0)
+  for (const c of ctx.trainPool) avail[razzRank(c)]++
+  const comboOf = (lo: number, hi: number) =>
+    lo === hi ? (avail[lo] * (avail[lo] - 1)) / 2 : avail[lo] * avail[hi]
+
+  // 各席の到達尤度（自分のアクション頻度の積）
+  const L = Array.from({ length: ctx.n }, () => new Float64Array(196).fill(1))
+  const steps: RazzTreeStep[] = []
+  let cur = ctx.root
+  for (const raw of chars) {
+    if (cur.done || cur.actor < 0) {
+      throw new Error('razz: history continues past end of street')
+    }
+    const legal = legalActionsOf(cur, ctx)
+    const action = coerceRazzAction(raw, legal)
+    if (!action) throw new Error(`razz: illegal action "${raw}" in history`)
+    const aIdx = legal.indexOf(action)
+    const s = cur.actor
+    const pairFreqs = pairStrategiesAt(sol, ctx, cur, s, legal.length)
+    // この判断ノードでの到達レンジ×コンボ加重の集計頻度
+    const agg = new Array<number>(legal.length).fill(0)
+    let weight = 0
+    for (let lo = 1; lo <= 13; lo++) {
+      for (let hi = lo; hi <= 13; hi++) {
+        const idx = lo * 14 + hi
+        const w = comboOf(lo, hi) * L[s][idx]
+        if (w <= 0) continue
+        weight += w
+        const f = pairFreqs[idx]
+        for (let ai = 0; ai < legal.length; ai++) agg[ai] += w * f[ai]
+      }
+    }
+    steps.push({
+      seatIndex: s,
+      action,
+      actions: [...legal],
+      freqs: weight > 0 ? agg.map((x) => x / weight) : agg,
+    })
+    for (let lo = 1; lo <= 13; lo++) {
+      for (let hi = lo; hi <= 13; hi++) {
+        const idx = lo * 14 + hi
+        L[s][idx] *= pairFreqs[idx][aIdx]
+      }
+    }
+    cur = applyAction(cur, ctx, null, action)
+  }
+
+  if (cur.done || cur.actor < 0) {
+    return {
+      done: true,
+      actorIndex: -1,
+      actions: [],
+      cells: [],
+      totals: [],
+      comboTotals: [],
+      totalCombos: 0,
+      steps,
+    }
+  }
+
+  const p = cur.actor
+  const actions = legalActionsOf(cur, ctx)
+  const pairFreqs = pairStrategiesAt(sol, ctx, cur, p, actions.length)
+  const cells: RazzTreeCell[] = []
+  const totals = new Array<number>(actions.length).fill(0)
+  let totalCombos = 0
+  for (let lo = 1; lo <= 13; lo++) {
+    for (let hi = lo; hi <= 13; hi++) {
+      const idx = lo * 14 + hi
+      const combos = comboOf(lo, hi)
+      const reach = L[p][idx]
+      const frequencies = pairFreqs[idx]
+      cells.push({ ranks: [lo, hi], combos, reach, frequencies })
+      const w = combos * reach
+      if (w > 0) {
+        totalCombos += w
+        for (let ai = 0; ai < actions.length; ai++) totals[ai] += w * frequencies[ai]
+      }
+    }
+  }
+  const comboTotals = totals.slice()
+  if (totalCombos > 0) for (let ai = 0; ai < actions.length; ai++) totals[ai] /= totalCombos
+  return {
+    done: false,
+    actorIndex: p,
+    actions,
+    cells,
+    totals,
+    comboTotals,
+    totalCombos,
+    steps,
   }
 }

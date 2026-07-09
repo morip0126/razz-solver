@@ -15,6 +15,10 @@ export interface SolveGridRequest {
   rootExact?: boolean
   /** この頻度未満のアクションを 0 に丸めて再正規化（収束ノイズの除去）。 */
   threshold?: number
+  /** 席ごとの入口レンジ重み（経路上の先行ノードの解から。lo*14+hi、null = 既定）。 */
+  seatPairWeights?: (number[] | null)[]
+  /** 手番プレイヤー自身の到達重み（表示・集計にのみ使用）。 */
+  actorReach?: number[]
 }
 
 export type SolverResponse =
@@ -26,12 +30,14 @@ const post = (msg: SolverResponse) =>
   (self as unknown as { postMessage(m: SolverResponse): void }).postMessage(msg)
 
 self.onmessage = (e: MessageEvent<SolveGridRequest>) => {
-  const { id, spot, iterations, rootExact, threshold } = e.data
+  const { id, spot, iterations, rootExact, threshold, seatPairWeights, actorReach } = e.data
   try {
     const result = solveRazzRangeGrid(spot, {
       iterations,
       rootExact,
       threshold,
+      seatPairWeights,
+      actorReach,
       onProgress: (done, total) => post({ id, type: 'progress', done, total }),
     })
     post({ id, type: 'result', result })

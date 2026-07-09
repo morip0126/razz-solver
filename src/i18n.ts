@@ -43,6 +43,10 @@ const messages = {
   presetExact: { ja: '最高精度（正確・重い）', en: 'Exact (slow)' },
   go: { ja: '計算', en: 'Go' },
   solving: { ja: '計算中… {pct}%', en: 'Solving… {pct}%' },
+  nodeProgress: {
+    ja: '計算中… ノード {i}/{k}（{pct}%）',
+    en: 'Solving… node {i}/{k} ({pct}%)',
+  },
   previous: { ja: '戻る', en: 'Previous' },
   actorTitle: {
     ja: 'Pos {n}（{card}）の戦略 — 3rd street',
@@ -89,6 +93,10 @@ const messages = {
   noteThreshold: {
     ja: '頻度5%未満のアクションは収束ノイズとして省略し、再正規化して表示しています。',
     en: 'Actions below 5% frequency are treated as convergence noise, dropped, and renormalized.',
+  },
+  noteLazyTree: {
+    ja: '各プレイヤーのレンジは、経路上の判断ノードを解いた頻度で内生的に絞り込まれます（セルの濃さ＝到達確率）。訪問済みノードは再計算なしで即時表示されます。',
+    en: 'Each player\'s range narrows endogenously using the solved frequencies at earlier decision nodes on the line (cell opacity = reach). Visited nodes redisplay instantly.',
   },
 } as const
 
