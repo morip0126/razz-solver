@@ -76,10 +76,27 @@ describe('buckets', () => {
   it('ポストドローバケットの順序', () => {
     expect(postBucket(parseCards('7c 5d 4h 3s 2c'))).toBe(0) // ナッツ
     expect(postBucket(parseCards('8c 6d 4h 3s 2c'))).toBe(2) // 8 スムーズ
-    expect(postBucket(parseCards('Ac 8d 6h 4s 2c'))).toBe(10) // A ロー
-    expect(postBucket(parseCards('2c 2d 4h 5s 7c'))).toBe(11) // ペア
-    expect(postBucket(parseCards('6c 5d 4h 3s 2c'))).toBe(12) // ストレート
+    expect(postBucket(parseCards('Tc 7d 6h 4s 2c'))).toBe(6) // T スムーズ
+    expect(postBucket(parseCards('Ac 8d 6h 4s 2c'))).toBe(11) // A ロー
+    expect(postBucket(parseCards('2c 2d 4h 5s 7c'))).toBe(12) // ペア
+    expect(postBucket(parseCards('6c 5d 4h 3s 2c'))).toBe(13) // ストレート
     expect(describeBucket(0, 'post').pat).toBe('75432')
+  })
+
+  it('プリドローの細分化: スムーズ/ラフと引き目危険', () => {
+    // パット 75432 = 7s、76432 = 7r
+    expect(describeBucket(preBucket(parseCards('7c 5d 4h 3s 2c')), 'pre').pat).toBe('7s')
+    expect(describeBucket(preBucket(parseCards('7c 6d 4h 3s 2c')), 'pre').pat).toBe('7r')
+    // K7654 → 4567 キープは 1 枚でストレート完成があり得る（3/8）→ 危険フラグ
+    const risky = describeBucket(preBucket(parseCards('Kc 7d 6h 5s 4c')), 'pre')
+    expect(risky.draw1).toBe('7')
+    expect(risky.draw1Risky).toBe(true)
+    // K7642 → 2467 キープは危険なし
+    const safe = describeBucket(preBucket(parseCards('Kc 7d 6h 4s 2c')), 'pre')
+    expect(safe.draw1Risky).toBe(false)
+    // 同ランクで 4 フラッシュを避けられるならスートを選ぶ（7642 に h と c の 7）
+    const keep = bestKeep(parseCards('7c 6c 4c 2c 7h'), 4)
+    expect(new Set(keep.map((c) => c.suit)).size).toBeGreaterThan(1)
   })
 })
 
@@ -94,12 +111,14 @@ describe('solveDrawTree / queryDrawTree', () => {
 
     const rowOf = (pred: (b: number) => boolean) => root.rows.find((r) => pred(r.bucket))
     const foldIdx = root.actions.findIndex((a) => a.kind === 'fold')
-    // パット 7〜9 ロー（patTier ≤ 2）はほぼ降りない
-    const strong = rowOf((b) => Math.floor(b / 20) <= 2)
+    // パット 7〜9 ロー（patDetail ≤ 5）はほぼ降りない
+    const strong = rowOf((b) => Math.floor(b / 40) <= 5)
     expect(strong).toBeDefined()
     expect(strong!.freqs[foldIdx]).toBeLessThan(0.15)
     // 役なし・ドロー質最悪（J+ キープのみ）はフォールド優位
-    const trash = rowOf((b) => Math.floor(b / 20) === 7 && Math.floor(b / 4) % 5 === 4 && b % 4 === 3)
+    const trash = rowOf(
+      (b) => Math.floor(b / 40) === 11 && Math.floor(b / 4) % 10 >= 8 && b % 4 === 3,
+    )
     if (trash) expect(trash.freqs[foldIdx]).toBeGreaterThan(0.5)
 
     // 決定論性

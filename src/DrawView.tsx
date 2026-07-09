@@ -10,10 +10,11 @@ import type { DrawWorkerRequest, DrawWorkerResponse } from './worker/drawWorker'
 import { type Lang, t } from './i18n'
 
 const STACKS = [25, 50, 100] as const
+// バケット細分化（プリ480クラス）に合わせた反復数（50k ≈ 13秒が目安）
 const PRESETS = [
-  { key: 'presetFast', iterations: 50000 },
-  { key: 'presetStandard', iterations: 150000 },
-  { key: 'presetFine', iterations: 400000 },
+  { key: 'presetFast', iterations: 80000 },
+  { key: 'presetStandard', iterations: 200000 },
+  { key: 'presetFine', iterations: 500000 },
 ] as const
 
 // 表示 thresholding（razz と同じ 5%）
@@ -83,6 +84,7 @@ const POST_LABEL: Record<string, { ja: string; en: string }> = {
   '8': { ja: '8ロー', en: '8-low' },
   '9s': { ja: '9ロー（スムーズ）', en: 'smooth 9' },
   '9': { ja: '9ロー', en: '9-low' },
+  Ts: { ja: 'Tロー（スムーズ）', en: 'smooth T' },
   T: { ja: 'Tロー', en: 'T-low' },
   J: { ja: 'Jロー', en: 'J-low' },
   Q: { ja: 'Qロー', en: 'Q-low' },
@@ -96,7 +98,8 @@ function rowLabel(lang: Lang, row: DrawNode['rows'][number]): string {
   const l = row.label
   if (l.kind === 'post') return POST_LABEL[l.pat]?.[lang] ?? l.pat
   const pat = l.pat === '-' ? (lang === 'ja' ? '役なし' : 'no pat') : `${lang === 'ja' ? 'パット' : 'pat'} ${l.pat}`
-  return `${pat} / 1→${l.draw1} / 2→${l.draw2}`
+  const risky = l.draw1Risky ? '⚠' : ''
+  return `${pat} / 1→${l.draw1}${risky} / 2→${l.draw2}`
 }
 
 type SolveState =

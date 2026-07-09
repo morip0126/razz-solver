@@ -85,10 +85,12 @@ export interface DrawBucketRow {
 
 export interface DrawBucketLabel {
   kind: 'pre' | 'post'
-  /** pre: パットの強さ（'7'〜'A'、'-'=役なしでない）。post: 完成役ティア。 */
+  /** pre: パット詳細（'7s'〜'K/A'、'-'=役なし）。post: 完成役ティア。 */
   pat: string
   /** pre のみ: 1枚/2枚ドローの質（残り4枚/3枚の最高ランク）。 */
   draw1?: string
+  /** pre のみ: 1枚ドローのキープにストレート/フラッシュの引き目危険がある。 */
+  draw1Risky?: boolean
   draw2?: string
 }
 
@@ -118,19 +120,40 @@ export function patTier(hand: readonly Card[]): number {
 }
 
 /**
+ * パットの詳細ティア（スムーズ/ラフを 2 番目のランクで区別）:
+ * 0=7s(75xxx) 1=7r(76xxx) 2=8s(2番目≤6) 3=8r 4=9s(≤6) 5=9r 6=Ts(≤7) 7=Tr
+ * 8=J 9=Q 10=K/A 11=役なし。
+ */
+function patDetail(hand: readonly Card[]): number {
+  const v = lowballValue5(hand)
+  if (v[0] !== 0) return 11
+  const top = v[1]
+  const second = v[2]
+  if (top === 7) return second <= 5 ? 0 : 1
+  if (top === 8) return second <= 6 ? 2 : 3
+  if (top === 9) return second <= 6 ? 4 : 5
+  if (top === 10) return second <= 7 ? 6 : 7
+  if (top === 11) return 8
+  if (top === 12) return 9
+  return 10
+}
+
+/**
  * n 枚残しの最良キープ（ペアを崩し、高い札から捨てる）。
+ * 同ランク構成なら 4 フラッシュを避けるスートを選ぶ。
  * 返り値は残すカード。決定的（ドローの捨て札ルールとしても使う）。
  */
 export function bestKeep(hand: readonly Card[], n: number): Card[] {
   let best: Card[] | null = null
   let bestScore: number[] | null = null
-  const idx = [0, 1, 2, 3, 4]
   const choose = (start: number, picked: number[]) => {
     if (picked.length === n) {
       const kept = picked.map((i) => hand[i])
       const ranks = kept.map(lowballRank).sort((a, b) => b - a)
       const dups = ranks.length - new Set(ranks).size
-      const score = [dups, ...ranks] // 辞書式に小さいほど良い（ペアなし・低い札）
+      const flush = n === 4 && new Set(kept.map((c) => c.suit)).size === 1 ? 1 : 0
+      // 辞書式に小さいほど良い: ペアなし → 低い札 → （同ランクなら）4フラッシュ回避
+      const score = [dups, ...ranks, flush]
       let better = bestScore === null
       if (bestScore) {
         for (let i = 0; i < score.length; i++) {
@@ -146,15 +169,23 @@ export function bestKeep(hand: readonly Card[], n: number): Card[] {
       }
       return
     }
-    for (let i = start; i < idx.length; i++) choose(i + 1, [...picked, i])
+    for (let i = start; i < 5; i++) choose(i + 1, [...picked, i])
   }
   choose(0, [])
   return best!
 }
 
+/** 4 枚キープの引き目危険: 1 枚でストレートが完成し得る、または 4 フラッシュ。 */
+function keepDanger(kept: readonly Card[]): boolean {
+  if (new Set(kept.map((c) => c.suit)).size === 1) return true
+  const ranks = [...new Set(kept.map(lowballRank))].sort((a, b) => a - b)
+  if (ranks.length !== 4) return false
+  // 4 枚がある 5 連続窓に収まる（欠け 1 枚を引くとストレート）
+  return ranks[3] - ranks[0] <= 4
+}
+
 /** n 枚キープの質ティア（重複なしで残せる最良の最高ランク）。 */
-function keepTier(hand: readonly Card[], n: number): number {
-  const kept = bestKeep(hand, n)
+function keepTier(kept: readonly Card[], n: number): number {
   const ranks = kept.map(lowballRank)
   if (new Set(ranks).size < ranks.length) return n === 4 ? 4 : 3 // ペアが残る = 最悪
   const top = Math.max(...ranks)
@@ -162,41 +193,54 @@ function keepTier(hand: readonly Card[], n: number): number {
   return top <= 7 ? 0 : top === 8 ? 1 : top === 9 ? 2 : 3
 }
 
-/** プリドローのバケット（パット × 1枚ドロー質 × 2枚ドロー質、≤160）。 */
+/**
+ * プリドローのバケット:
+ * パット詳細(12) × [1枚ドロー質(5) × 引き目危険(2)](10) × 2枚ドロー質(4) = ≤480。
+ * ブロッカー（2/7 の保有）は情報集合の分割コストに対する効果が薄いため含めない。
+ */
 export function preBucket(hand: readonly Card[]): number {
-  return (patTier(hand) * 5 + keepTier(hand, 4)) * 4 + keepTier(hand, 3)
+  const keep4 = bestKeep(hand, 4)
+  const d1 = keepTier(keep4, 4) * 2 + (keepDanger(keep4) ? 1 : 0)
+  const d2 = keepTier(bestKeep(hand, 3), 3)
+  return (patDetail(hand) * 10 + d1) * 4 + d2
 }
 
-/** ポストドローのバケット（完成役ティア 0..12）。 */
+/** ポストドローのバケット（完成役ティア 0..13）。 */
 export function postBucket(hand: readonly Card[]): number {
   const v = lowballValue5(hand)
-  if (v[0] === 1) return 11
-  if (v[0] >= 2) return 12
+  if (v[0] === 1) return 12
+  if (v[0] >= 2) return 13
   const top = v[1]
   const second = v[2]
   if (top === 7) return second <= 5 ? 0 : 1
   if (top === 8) return second <= 6 ? 2 : 3
   if (top === 9) return second <= 6 ? 4 : 5
-  if (top === 10) return 6
-  if (top === 11) return 7
-  if (top === 12) return 8
-  if (top === 13) return 9
-  return 10
+  if (top === 10) return second <= 7 ? 6 : 7
+  if (top === 11) return 8
+  if (top === 12) return 9
+  if (top === 13) return 10
+  return 11
 }
 
 const PRE_D1 = ['7', '8', '9', 'T', '-']
 const PRE_D2 = ['7', '8', '9', '-']
-const PAT = ['7', '8', '9', 'T', 'J', 'Q', 'K/A', '-']
-const POST = ['75432', '7', '8s', '8', '9s', '9', 'T', 'J', 'Q', 'K', 'A', 'pair', 'trash']
+const PAT = ['7s', '7r', '8s', '8r', '9s', '9r', 'Ts', 'Tr', 'J', 'Q', 'K/A', '-']
+const POST = ['75432', '7', '8s', '8', '9s', '9', 'Ts', 'T', 'J', 'Q', 'K', 'A', 'pair', 'trash']
 
 export function describeBucket(bucket: number, phase: 'pre' | 'draw' | 'post'): DrawBucketLabel {
   if (phase === 'post') {
     return { kind: 'post', pat: POST[bucket] ?? '?' }
   }
   const d2 = bucket % 4
-  const d1 = Math.floor(bucket / 4) % 5
-  const pat = Math.floor(bucket / 20)
-  return { kind: 'pre', pat: PAT[pat] ?? '?', draw1: PRE_D1[d1], draw2: PRE_D2[d2] }
+  const d1 = Math.floor(bucket / 4) % 10
+  const pat = Math.floor(bucket / 40)
+  return {
+    kind: 'pre',
+    pat: PAT[pat] ?? '?',
+    draw1: PRE_D1[Math.floor(d1 / 2)],
+    draw1Risky: d1 % 2 === 1,
+    draw2: PRE_D2[d2],
+  }
 }
 
 // ---- ゲーム状態 -------------------------------------------------------------------
