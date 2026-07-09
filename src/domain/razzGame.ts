@@ -113,6 +113,15 @@ export interface RazzSolveOptions {
    * 従来どおりバケット抽象化のまま。既定 false。
    */
   rootExact?: boolean
+  /**
+   * グリッド出力の thresholding（Ganzfried & Sandholm 2012、docs/solver-theory.md §4.3）:
+   * この頻度未満のアクションを 0 に丸めて再正規化する。MCCFR の収束ノイズ
+   * （純戦略ハンドに残る数%の別アクション）を表示から除く。0 = 無効（既定）。
+   */
+  threshold?: number
+  /** MCCFR のチューニング（McCfrOptions へそのまま渡す。既定は razzCfr.ts 参照）。 */
+  regretMatchingPlus?: boolean
+  averagingExponent?: number
 }
 
 /**
@@ -679,7 +688,13 @@ export function solveRazzSpot(spot: RazzSpot, opts: RazzSolveOptions = {}): Razz
   )
 
   // 学習: Hero の伏せ札もレンジからサンプルして均衡を近似する
-  const sol = runMccfr(makeGame(ctx, null), { iterations, rng, onProgress: opts.onProgress })
+  const sol = runMccfr(makeGame(ctx, null), {
+    iterations,
+    rng,
+    onProgress: opts.onProgress,
+    regretMatchingPlus: opts.regretMatchingPlus,
+    averagingExponent: opts.averagingExponent,
+  })
 
   // 評価: Hero の実ハンドを固定してアクションごとの EV をロールアウト推定
   const evalGame = makeGame(ctx, ctx.heroDown)
@@ -731,6 +746,14 @@ function cardOfRazzRank(r: number): Card {
   return { rank: (r === 1 ? 14 : r) as Card['rank'], suit: 'c' }
 }
 
+/** 閾値未満の頻度を 0 に丸めて再正規化する（thresholding）。全滅する場合は元を返す。 */
+function thresholdStrategy(freqs: number[], threshold: number): number[] {
+  const kept = freqs.map((f) => (f < threshold ? 0 : f))
+  const total = kept.reduce((x, y) => x + y, 0)
+  if (total <= 0) return freqs
+  return kept.map((f) => f / total)
+}
+
 /** 文字列履歴を 1 文字ずつの配列へ（空白・区切り記号は無視）。 */
 function historyChars(history: RazzGridSpot['history']): readonly string[] {
   if (history == null) return []
@@ -751,6 +774,7 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
   }
   const rng = opts.rng ?? mulberry32((Math.random() * 0xffffffff) >>> 0)
   const iterations = opts.iterations ?? 30000
+  const threshold = opts.threshold ?? 0
   const ctx = buildCtx(
     {
       street: spot.street,
@@ -765,7 +789,13 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
     opts,
   )
 
-  const sol = runMccfr(makeGame(ctx, null), { iterations, rng, onProgress: opts.onProgress })
+  const sol = runMccfr(makeGame(ctx, null), {
+    iterations,
+    rng,
+    onProgress: opts.onProgress,
+    regretMatchingPlus: opts.regretMatchingPlus,
+    averagingExponent: opts.averagingExponent,
+  })
 
   const actor = ctx.heroIndex
   const actions = legalActionsOf(ctx.root, ctx)
@@ -793,7 +823,8 @@ export function solveRazzRangeGrid(spot: RazzGridSpot, opts: RazzSolveOptions = 
         ? `e${r1}.${r2}`
         : String(razzHandBucket([cardOfRazzRank(r1), cardOfRazzRank(r2), ...ctx.seats[actor].up]))
       const key = `${ctx.root.street}|${ctx.root.hist}|${own}|${tiers}`
-      const frequencies = averageStrategy(sol, key, actions.length)
+      let frequencies = averageStrategy(sol, key, actions.length)
+      if (threshold > 0) frequencies = thresholdStrategy(frequencies, threshold)
       cells.push({ ranks: [r1, r2], combos, frequencies })
       if (combos > 0) {
         totalCombos += combos

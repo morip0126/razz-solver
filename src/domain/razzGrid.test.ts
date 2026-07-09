@@ -109,6 +109,20 @@ describe('solveRazzRangeGrid', () => {
     expect(freq(r, cell(r, 13, 13), 'fold')).toBeGreaterThan(0.6)
   }, 60000)
 
+  it('threshold: 閾値未満の頻度は 0 に丸めて再正規化される', () => {
+    const r = solveRazzRangeGrid(GRID_SPOT, {
+      iterations: 500,
+      rng: mulberry32(12),
+      threshold: 0.2,
+    })
+    for (const c of r.cells) {
+      expect(c.frequencies.reduce((x, y) => x + y, 0)).toBeCloseTo(1, 6)
+      for (const f of c.frequencies) {
+        if (f > 0) expect(f).toBeGreaterThanOrEqual(0.2)
+      }
+    }
+  })
+
   it('入力検証: 7th 非対応、ハンド終了後の履歴はエラー', () => {
     expect(() =>
       solveRazzRangeGrid({ ...GRID_SPOT, street: 7 }, { iterations: 10 }),

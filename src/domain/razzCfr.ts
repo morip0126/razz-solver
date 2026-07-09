@@ -2,6 +2,15 @@
 // ゲーム定義は CfrGame インターフェースで注入する（razzCfr.test.ts では Kuhn poker で
 // 既知の均衡に収束することを検証する）。2人ゲームでは均衡近似の理論保証があり、
 // 3人以上では保証はないが実用的な近似戦略として用いる。
+//
+// vanilla MCCFR に対する高速化（理論的背景と実験は docs/solver-theory.md）:
+// - 平均戦略の二次加重（DCFR γ=2、既定で有効）: 反復 t の寄与を t² に比例させ、学習初期の
+//   一様分布が平均戦略に残る（純戦略のハンドに数%の別アクションが混ざる）のを防ぐ。
+//   Razz 3rd street の実験で残留ノイズが 11%→1.6% に減少した。
+// - regret-matching+（CFR+ / DCFR β=0、**既定で無効**）: external sampling と併用すると
+//   サンプリング分散でリグレットが振動し、むしろ大幅に悪化した（文献の指摘どおり。
+//   分散低減 = VR-MCCFR と併用して初めて機能する）。オプションとしてのみ残す。
+// DCFR の正リグレット割引（α=1.5）は全ノード走査が必要になるため採用していない。
 
 export interface CfrGame<TDeal, TState> {
   readonly numPlayers: number
@@ -75,32 +84,46 @@ function traverse<TDeal, TState>(
   deal: TDeal,
   traverser: number,
   rng: () => number,
+  avgWeight: number,
+  rmPlus: boolean,
 ): number {
   if (game.isTerminal(state)) return game.utility(state, deal, traverser)
   const actions = game.legalActions(state)
   if (actions.length === 1) {
-    return traverse(game, sol, game.nextState(state, deal, actions[0]), deal, traverser, rng)
+    return traverse(
+      game, sol, game.nextState(state, deal, actions[0]), deal, traverser, rng, avgWeight, rmPlus,
+    )
   }
   const player = game.currentPlayer(state)
   const node = getNode(sol, game.infosetKey(state, deal), actions)
   const strategy = currentStrategy(node)
 
   if (player === traverser) {
-    // 自分の手番: 全アクションを展開してリグレット更新
+    // 自分の手番: 全アクションを展開してリグレット更新（regret-matching+ でクリップ）
     const utils = new Array<number>(actions.length)
     let value = 0
     for (let i = 0; i < actions.length; i++) {
-      utils[i] = traverse(game, sol, game.nextState(state, deal, actions[i]), deal, traverser, rng)
+      utils[i] = traverse(
+        game, sol, game.nextState(state, deal, actions[i]), deal, traverser, rng, avgWeight, rmPlus,
+      )
       value += strategy[i] * utils[i]
     }
-    for (let i = 0; i < actions.length; i++) node.regret[i] += utils[i] - value
+    if (rmPlus) {
+      for (let i = 0; i < actions.length; i++) {
+        node.regret[i] = Math.max(0, node.regret[i] + utils[i] - value)
+      }
+    } else {
+      for (let i = 0; i < actions.length; i++) node.regret[i] += utils[i] - value
+    }
     return value
   }
 
-  // 相手の手番: 平均戦略を蓄積し、現在戦略から 1 アクションをサンプル
-  for (let i = 0; i < actions.length; i++) node.strategySum[i] += strategy[i]
+  // 相手の手番: 平均戦略を反復加重つきで蓄積し、現在戦略から 1 アクションをサンプル
+  for (let i = 0; i < actions.length; i++) node.strategySum[i] += avgWeight * strategy[i]
   const idx = sampleIndex(strategy, rng)
-  return traverse(game, sol, game.nextState(state, deal, actions[idx]), deal, traverser, rng)
+  return traverse(
+    game, sol, game.nextState(state, deal, actions[idx]), deal, traverser, rng, avgWeight, rmPlus,
+  )
 }
 
 export interface McCfrOptions {
@@ -108,6 +131,10 @@ export interface McCfrOptions {
   rng?: () => number
   /** 学習の進捗通知（約1%刻み）。Web Worker から UI へ進捗を返すために使う。 */
   onProgress?: (done: number, total: number) => void
+  /** regret-matching+（負の累積リグレットをクリップ）。既定 false。 */
+  regretMatchingPlus?: boolean
+  /** 平均戦略の反復加重の指数（DCFR の γ。0 = 一様平均）。既定 2。 */
+  averagingExponent?: number
 }
 
 /** external sampling MCCFR を実行し、蓄積した解を返す。 */
@@ -118,10 +145,13 @@ export function runMccfr<TDeal, TState>(
   const rng = opts.rng ?? Math.random
   const sol: CfrSolution = { nodes: new Map() }
   const step = opts.onProgress ? Math.max(1, Math.ceil(opts.iterations / 100)) : 0
+  const gamma = opts.averagingExponent ?? 2
+  const rmPlus = opts.regretMatchingPlus ?? false
   for (let it = 0; it < opts.iterations; it++) {
+    const avgWeight = gamma === 0 ? 1 : (it + 1) ** gamma
     for (let p = 0; p < game.numPlayers; p++) {
       const deal = game.sampleDeal(rng)
-      traverse(game, sol, game.initialState(deal), deal, p, rng)
+      traverse(game, sol, game.initialState(deal), deal, p, rng, avgWeight, rmPlus)
     }
     if (step && ((it + 1) % step === 0 || it + 1 === opts.iterations)) {
       opts.onProgress!(it + 1, opts.iterations)

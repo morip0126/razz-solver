@@ -86,6 +86,10 @@ const messages = {
     ja: '手番ストリートはランクペアごとに正確に計算しています（以降のストリートはバケット抽象化）。スートは自動割り当てです。',
     en: 'The current street is solved exactly per rank pair (later streets remain bucket-abstracted). Suits are auto-assigned.',
   },
+  noteThreshold: {
+    ja: '頻度5%未満のアクションは収束ノイズとして省略し、再正規化して表示しています。',
+    en: 'Actions below 5% frequency are treated as convergence noise, dropped, and renormalized.',
+  },
 } as const
 
 export type MessageKey = keyof typeof messages

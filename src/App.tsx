@@ -51,6 +51,10 @@ const PRESETS = [
   { key: 'presetExact', iterations: 40000, rootExact: true },
 ] as const satisfies readonly { key: MessageKey; iterations: number; rootExact: boolean }[]
 
+// 表示 thresholding: この頻度未満のアクションは収束ノイズとみなして 0 に丸める
+// （Ganzfried & Sandholm 2012。docs/solver-theory.md §4.3）
+const DISPLAY_THRESHOLD = 0.05
+
 interface StakesInput {
   ante: string
   bringIn: string
@@ -135,7 +139,7 @@ function useGridSolver() {
       else if (msg.type === 'result') setState({ status: 'done', result: msg.result })
       else setState({ status: 'error', message: msg.message })
     }
-    const req: SolveGridRequest = { id, spot, iterations, rootExact }
+    const req: SolveGridRequest = { id, spot, iterations, rootExact, threshold: DISPLAY_THRESHOLD }
     worker.postMessage(req)
   }, [])
 
@@ -482,7 +486,10 @@ export default function App() {
             ))}
           </div>
 
-          <p className="hint">{t(lang, result.rootExact ? 'noteExact' : 'noteAbstraction')}</p>
+          <p className="hint">
+            {t(lang, result.rootExact ? 'noteExact' : 'noteAbstraction')}{' '}
+            {t(lang, 'noteThreshold')}
+          </p>
         </section>
       )}
     </main>

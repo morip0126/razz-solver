@@ -13,6 +13,8 @@ export interface SolveGridRequest {
   iterations: number
   /** 手番ストリートを正確な伏せ札ランクで解く（時間がかかる）。 */
   rootExact?: boolean
+  /** この頻度未満のアクションを 0 に丸めて再正規化（収束ノイズの除去）。 */
+  threshold?: number
 }
 
 export type SolverResponse =
@@ -24,11 +26,12 @@ const post = (msg: SolverResponse) =>
   (self as unknown as { postMessage(m: SolverResponse): void }).postMessage(msg)
 
 self.onmessage = (e: MessageEvent<SolveGridRequest>) => {
-  const { id, spot, iterations, rootExact } = e.data
+  const { id, spot, iterations, rootExact, threshold } = e.data
   try {
     const result = solveRazzRangeGrid(spot, {
       iterations,
       rootExact,
+      threshold,
       onProgress: (done, total) => post({ id, type: 'progress', done, total }),
     })
     post({ id, type: 'result', result })
